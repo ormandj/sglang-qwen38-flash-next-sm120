@@ -7,7 +7,8 @@ cache_schema=$(jq -er '.cache_schema' "$repo/release.json")
 local_image="sglang-qwen38-flash-next-sm120:${candidate_tag}"
 launcher="$repo/examples/serve-qwen38-flash-next.sh"
 
-for file in README.md RUN.md BENCHMARKS.md CHANGELOG.md NOTICE.md "$launcher"; do
+for file in README.md RUN.md BENCHMARKS.md CHANGELOG.md NOTICE.md \
+  evidence/v0.1.0-rc.9/publication-summary.json "$launcher"; do
   [[ -s "$repo/$file" || -s "$file" ]] || { echo "required file missing: $file" >&2; exit 1; }
 done
 
@@ -22,6 +23,8 @@ require_text "$launcher" "IMAGE=\${IMAGE:-${local_image}}"
 require_text "$repo/RUN.md" "/srv/cache/sglang-qwen38-flash-next-sm120-${cache_schema}"
 require_text "$repo/CHANGELOG.md" "## ${candidate_tag}"
 require_text "$repo/BENCHMARKS.md" '95.83%'
+require_text "$repo/BENCHMARKS.md" '3772dddaf9b0caf6027d09ca084df2862daedbb3c0961c3b8015c19a3b47205c'
+require_text "$repo/BENCHMARKS.md" '0797bb93a90b915d29ccacb068f1ca10bd8a0e62c1c87216a1bd889860019f53'
 
 critical=(
   'TP_SIZE=${TP_SIZE:-2}'

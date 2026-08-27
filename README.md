@@ -6,9 +6,11 @@ checkpoint on two NVIDIA RTX PRO 6000 Blackwell GPUs (SM120).
 
 This is an experimental `v0.1.0-rc.9` source release. The exact candidate has
 passed dual-SM120 startup, text, reasoning, tool-call, image-input, decode,
-cold-prefill, and full GSM8K checks. Near-native-context, non-speculative, and
-uniform publication-performance panels have not been completed, so there is no
-stable or cross-hardware performance claim yet.
+cold-prefill, full GSM8K, and the five-run supported-concurrency publication
+panel. C32 is explicitly unsupported by the tested token-pool capacity rather
+than reported as a timing result. Near-native-context and non-speculative
+panels have not been completed, so there is no stable or cross-hardware
+performance claim yet.
 
 ## Tested configuration
 
@@ -36,6 +38,28 @@ Qwen did not emit GSM8K's literal `####` answer marker, so the pinned AIPerf
 grader marked every response `unparsed` and used its documented last-number
 fallback. The fallback extracted an answer for all 1,319 responses. See
 [`BENCHMARKS.md`](BENCHMARKS.md) for the exact method, provenance, and hashes.
+
+## Performance result
+
+The frozen DSV4F publication workload completed five valid repetitions at each
+supported decode concurrency on one unchanged server process. It used 16,384
+requested input tokens, 4,096 forced output tokens, temperature zero, and fixed
+seeds.
+
+| C | Forward/s | Forced output tok/s | ITL | Output/forward/request |
+|---:|---:|---:|---:|---:|
+| 1 | 74.355 | 196.3 | 5.155 ms | 2.611 |
+| 2 | 61.806 | 336.6 | 6.150 ms | 2.746 |
+| 4 | 47.059 | 508.4 | 8.123 ms | 2.664 |
+| 8 | 33.163 | 758.8 | 11.030 ms | 2.876 |
+| 16 | 23.573 | 1,062.1 | 17.010 ms | 2.808 |
+
+Five cache-busted cold-prefill requests per cell produced 9,428 prompt tok/s at
+8K, 11,392 at 32K, 11,543 at 64K, and 11,252 at 128K. These are controlled
+fixed-window engineering results, not expected application throughput. The
+full method, DSV4F comparison, capacity disposition, and exact aggregate are in
+[`BENCHMARKS.md`](BENCHMARKS.md) and
+[`evidence/v0.1.0-rc.9/publication-summary.json`](evidence/v0.1.0-rc.9/publication-summary.json).
 
 ## Build and run
 
