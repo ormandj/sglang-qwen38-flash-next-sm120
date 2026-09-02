@@ -78,7 +78,6 @@ exec docker run --rm \
   --volume "${cache_dir}:/root/.cache" \
   --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
   --env SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0 \
-  --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   --env TORCHINDUCTOR_CACHE_DIR=/root/.cache/torchinductor \
   --env TILELANG_CACHE_DIR=/root/.cache/tilelang \
   --env TRITON_CACHE_DIR=/root/.cache/triton \
@@ -96,6 +95,7 @@ exec docker run --rm \
   --mamba-ssm-dtype bfloat16 \
   --ple-offload-embedding \
   --max-running-requests "$MAX_RUNNING_REQUESTS" \
+  --cuda-graph-max-bs 32 \
   --reasoning-parser auto \
   --tool-call-parser auto \
   --enable-metrics \

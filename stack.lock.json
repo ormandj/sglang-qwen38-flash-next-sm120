@@ -87,8 +87,8 @@
     },
     {
       "arg": "QWEN38_SGLANG_EFFECTIVE_TREE",
-      "value": "1cf4eb136f470e0dba5eed62d107d16e6bc3ed85",
-      "description": "Final SGLang tree reproduced from current main and the archived integration patch."
+      "value": "2bf157ed74501598305c55f478025ea1f4d80ec8",
+      "description": "Final host-optimized SGLang tree reproduced from current main and the archived integration patch."
     },
     {
       "arg": "QWEN38_MODEL_REVISION",
@@ -116,7 +116,7 @@
       "base": "7f27bf470824f452a34e866d22ab5e332a23e26f",
       "head": "b03fdaa5c4bb011908e9359c498dbe20a5e05deb",
       "upstream_pr_head": "73a255206f916366c8d26d4022f82ddfb0ab558d",
-      "effective_tree": "1cf4eb136f470e0dba5eed62d107d16e6bc3ed85",
+      "effective_tree": "2bf157ed74501598305c55f478025ea1f4d80ec8",
       "commits": [
         {
           "source": "sgl-project/sglang#36497",
@@ -158,8 +158,8 @@
       "repository": "sglang",
       "order": 1,
       "path": "patches/sglang/0001-qwen38-flash-next-v0.1.0-rc.9.patch",
-      "sha256": "58522c126e4c20371327ed087c75dbfb81cf3426b9fa74996ef40e27b6c2d2e6",
-      "source": "current-main integration of sgl-project/sglang#36497, #36556, and the MTP current-main fixes",
+      "sha256": "6c5cc32e818373d8cc949d846baba31577f71479b0a390ce79588f99a1047429",
+      "source": "Current-main integration of sgl-project/sglang#36497 and #36556, MTP fixes, and accuracy-preserving SM120 performance kernels",
       "source_head": "b03fdaa5c4bb011908e9359c498dbe20a5e05deb"
     }
   ],

@@ -6,7 +6,9 @@
   `sha256:ce30879b5d473967fe3f0f6947a63efe2ea971dc47fd086ac0db5c54fb0c8387`
 - Model revision: `bcd9f01ddc9cff2316eb84281bebcd5b058bddce`
 - SGLang main: `7f27bf470824f452a34e866d22ab5e332a23e26f`
-- Effective SGLang tree: `1cf4eb136f470e0dba5eed62d107d16e6bc3ed85`
+- Published-image effective SGLang tree: `1cf4eb136f470e0dba5eed62d107d16e6bc3ed85`
+  (the current source patch reproduces `2bf157ed74501598305c55f478025ea1f4d80ec8`;
+  its native qualification is recorded below and the image must be rebuilt).
 - FlashInfer main: `e4b7fa4b7c3ba5e17286d9c59f2bcf2ca07e0a6d`
 - AIPerf: `6ed4823d127b3a6d12c63fb8c2ca5eff13f9ba23`
 - Runtime: TP2/EP2, NEXTN 3/1/4, native 262,144 context, HiCache off.
@@ -130,6 +132,46 @@ The exact machine-readable supported-panel aggregate is published at
 and hashes to
 `3772dddaf9b0caf6027d09ca084df2862daedbb3c0961c3b8015c19a3b47205c`.
 
-Near-native-context, non-speculative, AgentX, and human release-review gates
-remain pending. This repository is therefore an experimental source release,
-not a stable or cross-hardware performance claim.
+For the published image, near-native-context, non-speculative, AgentX, and
+human release-review gates remain pending. It is therefore an experimental
+release, not a stable or cross-hardware performance claim.
+
+## Post-image SM120 source optimization
+
+The current archived SGLang patch applies to the same pinned `7f27bf4708` base
+and reproduces tree `2bf157ed74501598305c55f478025ea1f4d80ec8`. The source was qualified
+natively with the same model revision, TP2/EP2 topology, FlashInfer linear
+attention, and NEXTN 3/1/4 envelope. These are single-run engineering results,
+not replacements for the five-run published-image panel above.
+
+The optimized path fuses QSA index preparation and compression, keeps QSA
+prefill on FlashInfer, fuses GDN projection/convolution, removes PLE,
+hyperconnection, and MoE gate host/allocation overhead, and selects measured
+SM120 MoE kernel configurations. Replay-based SSM graph optimization remains
+disabled because it did not preserve exact GDN state semantics. CUDA-graph
+FlashAttention scratch storage is retained per captured capacity so a wider
+capture cannot invalidate pointers held by an earlier graph.
+
+| Workload and metric | Original patch | Optimized source | Change |
+|---|---:|---:|---:|
+| C1 output throughput | 180.74 tok/s | 200.83 tok/s | +11.1% |
+| C1 mean TPOT | 5.236 ms | 4.693 ms | -10.4% |
+| C1 mean TTFT | 1,202.5 ms | 1,162.8 ms | -3.3% |
+| C16 output throughput | 757.19 tok/s | 859.60 tok/s | +13.5% |
+| C16 mean TPOT | 17.561 ms | 15.690 ms | -10.7% |
+| C16 mean TTFT | 10,640.9 ms | 10,459.0 ms | -1.7% |
+
+Both C1 runs used exactly 16,332 input and 4,096 output tokens. The C16 runs
+used 262,140 and 261,308 input tokens respectively (a 0.32% difference) and
+65,536 output tokens each. NEXTN acceptance also improved by 7.3%; dividing
+output throughput by acceptance length leaves a +3.6% C1 and +5.8% C16
+wall-clock forward-rate proxy, so the output-rate gain is not attributed solely
+to kernel speed.
+
+The final source passed 224 selected kernel, graph, model, and memory-cache
+tests with no failures. A fixed 32-token greedy request produced byte-identical
+text and token IDs before and after the optimization. The full-context smoke
+generated eight tokens from a 262,000-token prompt in 21.85 seconds, and two
+sequential 128K graph-backed requests completed without an illegal-address or
+server restart. The launcher now bounds capture at batch size 32; the state
+cache still caps this exact runtime to 27 active requests.

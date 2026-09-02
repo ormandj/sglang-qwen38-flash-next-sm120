@@ -18,10 +18,10 @@ index d0b9d623a1c99e0934ac6e9659cc2a4cbe2f4420..9317d5c3fc443a5f169240d38a7ad06b
          "DeepseekV3ForCausalLM",
 diff --git a/python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh b/python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e9e3b2ceec05e46d089b8149af4b4feecacabe9
+index 0000000000000000000000000000000000000000..d292f618204ed93d06f662cb9ec52a00d705b802
 --- /dev/null
 +++ b/python/sglang/kernels/jit/csrc/attention/qsa_indexer.cuh
-@@ -0,0 +1,568 @@
+@@ -0,0 +1,575 @@
 +// Fused QSA (Qwen4-Exp sparse attention) indexer-prep kernels.
 +//
 +// qsa_index_q_prep_kernel replaces, per token, the eager chain
@@ -307,6 +307,10 @@ index 0000000000000000000000000000000000000000..1e9e3b2ceec05e46d089b8149af4b4fe
 +    params.rope_position_buffer[loc * 3 + lane] = pos[lane];
 +  }
 +
++  // A dependent kernel may consume q_out and both state stores immediately.
++  // Do not signal launch completion until every producer warp in this CTA
++  // has finished its writes.
++  __syncthreads();
 +  device::PDLTriggerSecondary<kUsePDL>();
 +}
 +
@@ -339,12 +343,11 @@ index 0000000000000000000000000000000000000000..1e9e3b2ceec05e46d089b8149af4b4fe
 +  const uint32_t warp = threadIdx.x / kWarpThreads;
 +  const uint32_t lane = threadIdx.x % kWarpThreads;
 +  const uint32_t group = blockIdx.x * 4 + warp;
-+  if (group >= static_cast<uint32_t>(params.num_groups)) {
-+    return;
-+  }
 +  __shared__ T smem_rows[4][kHeadDim];
 +
 +  device::PDLWaitPrimary<kUsePDL>();
++
++  if (group < static_cast<uint32_t>(params.num_groups)) {
 +
 +  const int32_t* locs = params.group_locs + group * params.compress_ratio;
 +  const int32_t loc0 = locs[0];
@@ -410,6 +413,10 @@ index 0000000000000000000000000000000000000000..1e9e3b2ceec05e46d089b8149af4b4fe
 +      smem_rows[warp], out_row, params.cos_sin_cache, params.axis_map, pos,
 +      params.rotary_dim);
 +
++  }
++  // One CTA handles four independent groups. A fast warp must not release
++  // the dependent launch while another warp is still publishing its group.
++  __syncthreads();
 +  device::PDLTriggerSecondary<kUsePDL>();
 +}
 +
@@ -592,10 +599,10 @@ index 0000000000000000000000000000000000000000..1e9e3b2ceec05e46d089b8149af4b4fe
 +}  // namespace sglang
 diff --git a/python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh b/python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2741a66f45313ac161c952cfe9c75e42a1194f1
+index 0000000000000000000000000000000000000000..e69165d79d0bb915b9c0001286bfcdbae777ffc2
 --- /dev/null
 +++ b/python/sglang/kernels/jit/csrc/elementwise/fast_topk.cuh
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,327 @@
 +// Radix-select fast top-k, adapted from sgl-kernel's AOT topk.cu (itself
 +// adapted from tilelang's topk_selector). Ported to the JIT layer so that
 +// kTopK = 512 support ships with the sglang python package instead of
@@ -835,7 +842,58 @@ index 0000000000000000000000000000000000000000..d2741a66f45313ac161c952cfe9c75e4
 +    radix_select_topk<kTopK>(score, indice, row_start, length);
 +  }
 +
++  // In the naive path, idle lanes can otherwise signal the dependent launch
++  // before producer lanes have populated the output row.
++  __syncthreads();
 +  device::PDLTriggerSecondary<kUsePDL>();
++}
++
++template <int kTopK, bool kUsePDL>
++void launch_fast_topk(
++    const tvm::ffi::TensorView score,
++    const tvm::ffi::TensorView* row_starts,
++    const tvm::ffi::TensorView indices,
++    const tvm::ffi::TensorView lengths) {
++  using namespace host;
++  auto B = SymbolicSize{"batch"};
++  auto L = SymbolicSize{"length"};
++  auto S = SymbolicSize{"input_stride"};
++  auto device = SymbolicDevice{};
++  device.set_options<kDLCUDA>();
++
++  TensorMatcher({B, L})  // score
++      .with_strides({S, 1})
++      .with_dtype<fp32_t>()
++      .with_device(device)
++      .verify(score);
++  if (row_starts != nullptr) {
++    TensorMatcher({B})  // row_starts
++        .with_dtype<int32_t>()
++        .with_device(device)
++        .verify(*row_starts);
++  }
++  TensorMatcher({B, kTopK})  // indices
++      .with_dtype<int32_t>()
++      .with_device(device)
++      .verify(indices);
++  TensorMatcher({B})  // lengths
++      .with_dtype<int32_t>()
++      .with_device(device)
++      .verify(lengths);
++
++  const auto params = FastTopKParams{
++      .input = static_cast<const float*>(score.data_ptr()),
++      .row_starts = row_starts == nullptr
++          ? nullptr
++          : static_cast<const int32_t*>(row_starts->data_ptr()),
++      .indices = static_cast<int32_t*>(indices.data_ptr()),
++      .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
++      .input_stride = S.unwrap(),
++  };
++
++  const auto num_rows = static_cast<uint32_t>(B.unwrap());
++  LaunchKernel(num_rows, kThreadsPerBlock, device.unwrap(), kSmemBytes)
++      .enable_pdl(kUsePDL)(fast_topk_kernel<kTopK, kUsePDL>, params);
 +}
 +
 +}  // namespace fast_topk_detail
@@ -850,53 +908,24 @@ index 0000000000000000000000000000000000000000..d2741a66f45313ac161c952cfe9c75e4
 + */
 +template <int kTopK, bool kUsePDL>
 +struct FastTopKKernel {
-+  static constexpr auto kernel = fast_topk_detail::fast_topk_kernel<kTopK, kUsePDL>;
-+
 +  static void
 +  run(const tvm::ffi::TensorView score,
 +      const tvm::ffi::TensorView row_starts,
 +      const tvm::ffi::TensorView indices,
 +      const tvm::ffi::TensorView lengths) {
-+    using namespace host;
-+    auto B = SymbolicSize{"batch"};
-+    auto L = SymbolicSize{"length"};
-+    auto S = SymbolicSize{"input_stride"};
-+    auto device = SymbolicDevice{};
-+    device.set_options<kDLCUDA>();
++    fast_topk_detail::launch_fast_topk<kTopK, kUsePDL>(
++        score, &row_starts, indices, lengths);
++  }
++};
 +
-+    TensorMatcher({B, L})  // score
-+        .with_strides({S, 1})
-+        .with_dtype<fp32_t>()
-+        .with_device(device)
-+        .verify(score);
-+    TensorMatcher({B})  // row_starts
-+        .with_dtype<int32_t>()
-+        .with_device(device)
-+        .verify(row_starts);
-+    TensorMatcher({B, kTopK})  // indices
-+        .with_dtype<int32_t>()
-+        .with_device(device)
-+        .verify(indices);
-+    TensorMatcher({B})  // lengths
-+        .with_dtype<int32_t>()
-+        .with_device(device)
-+        .verify(lengths);
-+
-+    const auto params = fast_topk_detail::FastTopKParams{
-+        .input = static_cast<const float*>(score.data_ptr()),
-+        .row_starts = static_cast<const int32_t*>(row_starts.data_ptr()),
-+        .indices = static_cast<int32_t*>(indices.data_ptr()),
-+        .lengths = static_cast<const int32_t*>(lengths.data_ptr()),
-+        .input_stride = S.unwrap(),
-+    };
-+
-+    const auto num_rows = static_cast<uint32_t>(B.unwrap());
-+    LaunchKernel(
-+        num_rows,
-+        fast_topk_detail::kThreadsPerBlock,
-+        device.unwrap(),
-+        fast_topk_detail::kSmemBytes)
-+        .enable_pdl(kUsePDL)(kernel, params);
++template <int kTopK, bool kUsePDL>
++struct FastTopKZeroStartKernel {
++  static void
++  run(const tvm::ffi::TensorView score,
++      const tvm::ffi::TensorView indices,
++      const tvm::ffi::TensorView lengths) {
++    fast_topk_detail::launch_fast_topk<kTopK, kUsePDL>(
++        score, nullptr, indices, lengths);
 +  }
 +};
 +
@@ -1693,7 +1722,7 @@ index 0000000000000000000000000000000000000000..59e38518a44ff4c422893947c9793124
 +        eps,
 +    )
 diff --git a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
-index a1e9ae69f6968676d3c750cef72f1d01a19c636e..004e184cdce259c387d5e0daa372bfdd59d38e72 100644
+index a1e9ae69f6968676d3c750cef72f1d01a19c636e..4709b809819a3cf44a197a8cb1c2b2682409a46f 100644
 --- a/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
 +++ b/python/sglang/kernels/ops/attention/triton_gdn_fused_proj.py
 @@ -171,6 +171,8 @@ def fused_qkvzba_split_reshape_cat_contiguous_kernel(
@@ -1773,12 +1802,325 @@ index a1e9ae69f6968676d3c750cef72f1d01a19c636e..004e184cdce259c387d5e0daa372bfdd
          num_heads_qk,
          num_heads_v,
          head_qk,
+@@ -330,6 +339,312 @@ def fused_qkvzba_split_reshape_cat_contiguous(
+     return mixed_qkv, z, b, a
+ 
+ 
++# Fusion begins after the quantized GEMMs: qkvz=[q|k|v|z], ba=[b|a].
++# This tail unpacks both projections and updates the causal Conv1D state.
++
++
++@triton.jit
++def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
++    mixed_qkv,
++    z,
++    b,
++    a,
++    mixed_qkvz,
++    mixed_ba,
++    conv_state,
++    conv_weight,
++    conv_bias,
++    conv_state_indices,
++    stride_qkvz_batch: tl.constexpr,
++    stride_qkvz_dim: tl.constexpr,
++    stride_ba_batch: tl.constexpr,
++    stride_ba_dim: tl.constexpr,
++    stride_state_batch: tl.constexpr,
++    stride_state_dim: tl.constexpr,
++    stride_state_pos: tl.constexpr,
++    stride_weight_dim: tl.constexpr,
++    stride_weight_width: tl.constexpr,
++    stride_state_indices: tl.constexpr,
++    QKV_DIM: tl.constexpr,
++    V_DIM: tl.constexpr,
++    NUM_V_HEADS: tl.constexpr,
++    NUM_STATE_SLOTS: tl.constexpr,
++    STATE_LEN: tl.constexpr,
++    KERNEL_WIDTH: tl.constexpr,
++    HAS_BIAS: tl.constexpr,
++    SILU_ACTIVATION: tl.constexpr,
++    PAD_SLOT_ID: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    batch_idx = tl.program_id(0)
++    dim_idx = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    qkv_mask = dim_idx < QKV_DIM
++
++    x = tl.load(
++        mixed_qkvz + batch_idx * stride_qkvz_batch + dim_idx * stride_qkvz_dim,
++        mask=qkv_mask,
++        other=0.0,
++    )
++
++    state_slot = tl.load(conv_state_indices + batch_idx * stride_state_indices).to(
++        tl.int64
++    )
++    # Treat every out-of-range index as padding so stale replay metadata cannot
++    # turn an indexed state update into an OOB access.
++    valid_slot = (
++        (state_slot != PAD_SLOT_ID) & (state_slot >= 0) & (state_slot < NUM_STATE_SLOTS)
++    )
++    state_base = (
++        conv_state + state_slot * stride_state_batch + dim_idx * stride_state_dim
++    )
++
++    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
++    if HAS_BIAS:
++        acc += tl.load(conv_bias + dim_idx, mask=qkv_mask, other=0.0).to(tl.float32)
++
++    # Match the deployed direct-Triton update exactly. Its effective decode
++    # state length is width-1 even when the physical cache tensor is wider.
++    for pos in tl.static_range(KERNEL_WIDTH - 1):
++        state_value = tl.load(
++            state_base + pos * stride_state_pos,
++            mask=qkv_mask & valid_slot,
++            other=0.0,
++        )
++        weight_value = tl.load(
++            conv_weight + dim_idx * stride_weight_dim + pos * stride_weight_width,
++            mask=qkv_mask,
++            other=0.0,
++        )
++        # Do not force an FP32 multiply here. This expression deliberately
++        # retains the operand types/order of causal_conv1d_triton.py.
++        acc += state_value * weight_value
++
++    last_weight = tl.load(
++        conv_weight
++        + dim_idx * stride_weight_dim
++        + (KERNEL_WIDTH - 1) * stride_weight_width,
++        mask=qkv_mask,
++        other=0.0,
++    )
++    acc += x * last_weight
++    if SILU_ACTIVATION:
++        conv_out = acc / (1.0 + tl.exp(-acc))
++    else:
++        conv_out = acc
++
++    # The legacy kernel leaves padded rows' input unchanged.
++    conv_out = tl.where(valid_slot, conv_out, x)
++    tl.store(
++        mixed_qkv + batch_idx * QKV_DIM + dim_idx,
++        conv_out,
++        mask=qkv_mask,
++    )
++
++    # The direct-Triton wrapper sets effective state_len=width-1 for decode.
++    for pos in tl.static_range(KERNEL_WIDTH - 2):
++        next_value = tl.load(
++            state_base + (pos + 1) * stride_state_pos,
++            mask=qkv_mask & valid_slot,
++            other=0.0,
++        )
++        tl.store(
++            state_base + pos * stride_state_pos,
++            next_value,
++            mask=qkv_mask & valid_slot,
++        )
++    tl.store(
++        state_base + (KERNEL_WIDTH - 2) * stride_state_pos,
++        x,
++        mask=qkv_mask & valid_slot,
++    )
++
++    # The first feature lanes also materialize the smaller downstream tensors.
++    z_mask = dim_idx < V_DIM
++    z_value = tl.load(
++        mixed_qkvz
++        + batch_idx * stride_qkvz_batch
++        + (QKV_DIM + dim_idx) * stride_qkvz_dim,
++        mask=z_mask,
++        other=0.0,
++    )
++    tl.store(z + batch_idx * V_DIM + dim_idx, z_value, mask=z_mask)
++
++    gate_mask = dim_idx < NUM_V_HEADS
++    b_value = tl.load(
++        mixed_ba + batch_idx * stride_ba_batch + dim_idx * stride_ba_dim,
++        mask=gate_mask,
++        other=0.0,
++    )
++    a_value = tl.load(
++        mixed_ba
++        + batch_idx * stride_ba_batch
++        + (NUM_V_HEADS + dim_idx) * stride_ba_dim,
++        mask=gate_mask,
++        other=0.0,
++    )
++    tl.store(b + batch_idx * NUM_V_HEADS + dim_idx, b_value, mask=gate_mask)
++    tl.store(a + batch_idx * NUM_V_HEADS + dim_idx, a_value, mask=gate_mask)
++
++
++def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
++    mixed_qkvz: torch.Tensor,
++    mixed_ba: torch.Tensor,
++    conv_state: torch.Tensor,
++    conv_weight: torch.Tensor,
++    conv_bias: torch.Tensor | None,
++    conv_state_indices: torch.Tensor,
++    *,
++    qkv_dim: int,
++    v_dim: int,
++    num_v_heads: int,
++    activation: str | None,
++) -> tuple[bool, str]:
++    """Return an explicit eligibility decision for the decode fusion."""
++    tensors = (mixed_qkvz, mixed_ba, conv_state, conv_weight, conv_state_indices)
++    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
++        return False, "all inputs must be torch.Tensor instances"
++    if not all(tensor.is_cuda for tensor in tensors):
++        return False, "CUDA tensors are required"
++    if mixed_qkvz.ndim != 2 or mixed_ba.ndim != 2:
++        return False, "projection outputs must be rank-2"
++    if conv_state.ndim != 3 or conv_weight.ndim != 2:
++        return False, "Conv1D state/weight ranks must be 3/2"
++    if conv_state_indices.ndim != 1:
++        return False, "conv_state_indices must be rank-1"
++    batch = mixed_qkvz.shape[0]
++    if mixed_ba.shape[0] != batch or conv_state_indices.shape[0] != batch:
++        return False, "batch dimensions must match"
++    if qkv_dim <= 0 or v_dim <= 0 or num_v_heads <= 0:
++        return False, "TP-local dimensions must be positive"
++    if mixed_qkvz.shape[1] != qkv_dim + v_dim:
++        return False, "qkvz layout is not contiguous [Q|K|V|Z]"
++    if mixed_ba.shape[1] != 2 * num_v_heads:
++        return False, "ba layout is not contiguous [B|A]"
++    if conv_state.shape[1] != qkv_dim or conv_weight.shape[0] != qkv_dim:
++        return False, "Conv1D feature dimension does not match packed QKV"
++    width = conv_weight.shape[1]
++    if width < 2 or width > 4:
++        return False, "only Conv1D widths 2 through 4 are supported"
++    if conv_state.shape[2] < width - 1:
++        return False, "Conv1D state is shorter than width - 1"
++    supported_dtypes = (torch.float16, torch.bfloat16, torch.float32)
++    if mixed_qkvz.dtype not in supported_dtypes:
++        return False, "QKVZ activation dtype must be FP16, BF16, or FP32"
++    if conv_state.dtype != mixed_qkvz.dtype or conv_weight.dtype != mixed_qkvz.dtype:
++        return False, "QKVZ, Conv1D state, and weight dtypes must match"
++    if mixed_ba.dtype not in supported_dtypes:
++        return False, "BA activation dtype must be FP16, BF16, or FP32"
++    if conv_bias is not None:
++        if (
++            not isinstance(conv_bias, torch.Tensor)
++            or not conv_bias.is_cuda
++            or conv_bias.ndim != 1
++            or conv_bias.shape[0] != qkv_dim
++            or conv_bias.dtype != mixed_qkvz.dtype
++        ):
++            return False, "Conv1D bias contract is incompatible"
++    if activation not in (None, "silu", "swish"):
++        return False, "activation must be None, silu, or swish"
++    if mixed_qkvz.stride(1) != 1 or mixed_ba.stride(1) != 1:
++        return False, "projection feature dimensions must be contiguous"
++    if conv_weight.stride(1) != 1:
++        return False, "Conv1D weight width dimension must be contiguous"
++    if conv_state_indices.dtype not in (torch.int32, torch.int64):
++        return False, "conv_state_indices must be int32 or int64"
++    return True, "eligible"
++
++
++def fused_qkvzba_causal_conv1d_update_contiguous(
++    mixed_qkvz: torch.Tensor,
++    mixed_ba: torch.Tensor,
++    conv_state: torch.Tensor,
++    conv_weight: torch.Tensor,
++    conv_bias: torch.Tensor | None,
++    conv_state_indices: torch.Tensor,
++    *,
++    qkv_dim: int,
++    v_dim: int,
++    num_v_heads: int,
++    head_v_dim: int,
++    activation: str | None,
++    pad_slot_id: int = -1,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Decode-only fused Qwen3.5 projection unpack and Conv1D state update."""
++    eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
++        mixed_qkvz,
++        mixed_ba,
++        conv_state,
++        conv_weight,
++        conv_bias,
++        conv_state_indices,
++        qkv_dim=qkv_dim,
++        v_dim=v_dim,
++        num_v_heads=num_v_heads,
++        activation=activation,
++    )
++    if not eligible:
++        raise ValueError(f"Ineligible fused GDN decode projection/Conv1D: {reason}")
++    if v_dim != num_v_heads * head_v_dim:
++        raise ValueError(
++            "Ineligible fused GDN decode projection/Conv1D: "
++            "v_dim must equal num_v_heads * head_v_dim"
++        )
++
++    batch = mixed_qkvz.shape[0]
++    mixed_qkv = torch.empty(
++        (batch, qkv_dim), dtype=mixed_qkvz.dtype, device=mixed_qkvz.device
++    )
++    z = torch.empty(
++        (batch, num_v_heads, head_v_dim),
++        dtype=mixed_qkvz.dtype,
++        device=mixed_qkvz.device,
++    )
++    b = torch.empty(
++        (batch, num_v_heads),
++        dtype=mixed_ba.dtype,
++        device=mixed_ba.device,
++    )
++    a = torch.empty_like(b)
++
++    block_size = 256
++    grid = (batch, triton.cdiv(qkv_dim, block_size))
++    _fused_qkvzba_causal_conv1d_update_contiguous_kernel[grid](
++        mixed_qkv,
++        z,
++        b,
++        a,
++        mixed_qkvz,
++        mixed_ba,
++        conv_state,
++        conv_weight,
++        conv_bias,
++        conv_state_indices,
++        mixed_qkvz.stride(0),
++        mixed_qkvz.stride(1),
++        mixed_ba.stride(0),
++        mixed_ba.stride(1),
++        conv_state.stride(0),
++        conv_state.stride(1),
++        conv_state.stride(2),
++        conv_weight.stride(0),
++        conv_weight.stride(1),
++        conv_state_indices.stride(0),
++        QKV_DIM=qkv_dim,
++        V_DIM=v_dim,
++        NUM_V_HEADS=num_v_heads,
++        NUM_STATE_SLOTS=conv_state.shape[0],
++        STATE_LEN=conv_state.shape[2],
++        KERNEL_WIDTH=conv_weight.shape[1],
++        HAS_BIAS=conv_bias is not None,
++        SILU_ACTIVATION=activation in ("silu", "swish"),
++        PAD_SLOT_ID=pad_slot_id,
++        BLOCK_SIZE=block_size,
++        num_warps=8,
++        num_stages=2,
++    )
++    return mixed_qkv, z, b, a
++
++
+ @triton.jit
+ def fused_qkv_split_gdn_prefill_kernel(
+     q,
 diff --git a/python/sglang/kernels/ops/elementwise/fast_topk.py b/python/sglang/kernels/ops/elementwise/fast_topk.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c242ba74ae8bef120235de2bba97b927d0d63c65
+index 0000000000000000000000000000000000000000..46e2daafc12ceb06158aa54161eb875fea977d1c
 --- /dev/null
 +++ b/python/sglang/kernels/ops/elementwise/fast_topk.py
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,77 @@
 +from __future__ import annotations
 +
 +from typing import Optional, TYPE_CHECKING
@@ -1812,7 +2154,13 @@ index 0000000000000000000000000000000000000000..c242ba74ae8bef120235de2bba97b927
 +        "fast_topk",
 +        *args,
 +        cuda_files=["elementwise/fast_topk.cuh"],
-+        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
++        cuda_wrappers=[
++            ("fast_topk", f"FastTopKKernel<{args}>::run"),
++            (
++                "fast_topk_zero_start",
++                f"FastTopKZeroStartKernel<{args}>::run",
++            ),
++        ],
 +    )
 +
 +
@@ -1842,12 +2190,13 @@ index 0000000000000000000000000000000000000000..c242ba74ae8bef120235de2bba97b927
 +    CUDA int32 tensor [B, topk]
 +    """
 +    batch = score.shape[0]
-+    if row_starts is None:
-+        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
 +    indices = score.new_empty((batch, topk), dtype=torch.int32)
 +
 +    module = _jit_fast_topk_module(topk)
-+    module.fast_topk(score, row_starts, indices, lengths)
++    if row_starts is None:
++        module.fast_topk_zero_start(score, indices, lengths)
++    else:
++        module.fast_topk(score, row_starts, indices, lengths)
 +    return indices
 diff --git a/python/sglang/kernels/ops/elementwise/hc_combine.py b/python/sglang/kernels/ops/elementwise/hc_combine.py
 new file mode 100644
@@ -3506,6 +3855,104 @@ index 0000000000000000000000000000000000000000..febfeff2ecb0d6a9647971c7454be2ae
 +    module = _jit_grouped_gemma_rmsnorm_module(group_size, input.dtype)
 +    module.grouped_gemma_rmsnorm(x, weight, out, eps)
 +    return out.reshape(input.shape)
+diff --git a/python/sglang/kernels/ops/moe/moe_fused_gate.py b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+index cf1c56fdab2b4f362704a43905b5bd97ab8e70f3..fad1373faefd6a7fcfc47510da954ae32890fe17 100644
+--- a/python/sglang/kernels/ops/moe/moe_fused_gate.py
++++ b/python/sglang/kernels/ops/moe/moe_fused_gate.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ import logging
+-from typing import TYPE_CHECKING, Tuple
++from typing import TYPE_CHECKING, Optional, Tuple
+ 
+ import torch
+ import triton
+@@ -109,6 +109,7 @@ def _router_triton_kernel(
+     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
+     RENORMALIZE: tl.constexpr,
+     APPLY_SCALE: tl.constexpr,  # apply_routed_scaling_factor_on_output
++    HAS_BIAS: tl.constexpr,
+     USE_PDL: tl.constexpr,
+     stride_sm,
+     stride_sn,
+@@ -126,10 +127,12 @@ def _router_triton_kernel(
+     mask_m = offs_m < M
+     mask_n = offs_n < N
+ 
+-    # prefetch bias before PDL wait
+-    bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(
+-        tl.float32
+-    )  # [BLOCK_N]
++    # Plain softmax routing has no bias; keep zero in registers rather than
++    # materializing and clearing a device tensor for every routing call.
++    if HAS_BIAS:
++        bias = tl.load(bias_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
++    else:
++        bias = tl.zeros([BLOCK_N], dtype=tl.float32)
+ 
+     if USE_PDL:
+         tl.extra.cuda.gdc_wait()
+@@ -254,7 +257,7 @@ def _router_triton_kernel(
+ @debug_kernel_api
+ def moe_fused_gate(
+     scores: torch.Tensor,
+-    bias: torch.Tensor,
++    bias: Optional[torch.Tensor],
+     topk: int,
+     scoring_func: str = "sigmoid",
+     num_fused_shared_experts: int = 0,
+@@ -282,17 +285,23 @@ def moe_fused_gate(
+         torch.float16,
+         torch.bfloat16,
+     ), "scores must be float32/float16/bfloat16"
+-    # The kernel loads the bias and upcasts it to fp32 in-register (see
+-    # _router_triton_kernel), so a non-fp32 bias (DeepSeek-V4 stores the
+-    # correction bias in bf16) needs no host-side cast/copy.
+-    assert bias.dtype in (
+-        torch.float32,
+-        torch.float16,
+-        torch.bfloat16,
+-    ), "bias must be float32/float16/bfloat16"
+     assert scores.ndim == 2, "scores must be 2D"
+-    assert bias.ndim == 1, "bias must be 1D"
+-    assert scores.size(1) == bias.size(0), "scores and bias must have same num_experts"
++    if bias is None:
++        assert (
++            scoring_func.lower() == "softmax"
++        ), "bias is required for non-softmax routing"
++    else:
++        # The kernel loads the bias and upcasts it to fp32 in-register, so a
++        # non-fp32 correction bias needs no host-side cast or copy.
++        assert bias.dtype in (
++            torch.float32,
++            torch.float16,
++            torch.bfloat16,
++        ), "bias must be float32/float16/bfloat16"
++        assert bias.ndim == 1, "bias must be 1D"
++        assert scores.size(1) == bias.size(
++            0
++        ), "scores and bias must have same num_experts"
+     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+     if routed_scaling_factor is None:
+         routed_scaling_factor = 1.0
+@@ -349,7 +358,7 @@ def moe_fused_gate(
+     extra = {"launch_pdl": True} if use_pdl else {}
+     _router_triton_kernel[grid](
+         scores,
+-        bias,
++        bias if bias is not None else scores,
+         weights,
+         indices,
+         M,
+@@ -369,6 +378,7 @@ def moe_fused_gate(
+         HAS_SOFTCAP=bool(moe_softcapping != 0.0),
+         RENORMALIZE=bool(renormalize),
+         APPLY_SCALE=bool(apply_routed_scaling_factor_on_output),
++        HAS_BIAS=bias is not None,
+         USE_PDL=use_pdl,
+         stride_sm=scores.stride(0),
+         stride_sn=scores.stride(1),
 diff --git a/python/sglang/kernels/ops/qwen4_ple.py b/python/sglang/kernels/ops/qwen4_ple.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..b872446f4745bc8052f90d21cdb32ce108ac3911
@@ -4513,6 +4960,141 @@ index f842df037351930dc52331c6cb693edb7603cfe7..d3e304fb2f220ec7472420f58698ed71
  
  class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
      """HybridLinearAttnBackend variant for short-conv hybrid models (ZAYA1 CCA,
+diff --git a/python/sglang/srt/layers/attention/linear/gdn_backend.py b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+index 40669014fdc840f20e5bd2e8045ad544873e5cb6..cdb189062c83c21829fc10fe95f134e7365087d0 100644
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -32,10 +32,15 @@ if not is_cpu():
+ 
+ if is_cuda() or is_hip() or is_xpu():
+     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
++        can_use_fused_qkvzba_causal_conv1d_update_contiguous,
+         fused_qkv_split_gdn_prefill,
++        fused_qkvzba_causal_conv1d_update_contiguous,
++        fused_qkvzba_split_reshape_cat_contiguous,
+     )
+ 
+ MAX_FUSED_QKV_SPLIT_DIM = 8192
++_fused_decode_proj_conv_logged = False
++_fused_decode_proj_conv_fallback_logged = False
+ 
+ if is_cuda():
+     from sglang.srt.layers.attention.mamba.causal_conv1d import (
+@@ -433,6 +438,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
+         b: torch.Tensor,
+         **kwargs,
+     ):
++        global _fused_decode_proj_conv_fallback_logged
++        global _fused_decode_proj_conv_logged
+         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
+             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+ 
+@@ -453,15 +460,78 @@ class GDNAttnBackend(MambaAttnBackendBase):
+         replayssm_k = layer_cache.replayssm_k
+         replayssm_g = layer_cache.replayssm_g
+ 
+-        assert isinstance(mixed_qkv, torch.Tensor)
+-        mixed_qkv = causal_conv1d_update(
+-            mixed_qkv,
+-            conv_states,
+-            layer.conv_weights,
+-            layer.bias,
+-            layer.activation,
+-            conv_state_indices=cache_indices,
+-        )
++        return_z = False
++        conv_already_applied = False
++        if isinstance(mixed_qkv, tuple):
++            if len(mixed_qkv) != 2:
++                raise ValueError(
++                    "Fused GDN decode projection input must be "
++                    "(projected_qkvz, projected_ba)"
++                )
++            projected_qkvz, projected_ba = mixed_qkv
++            qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
++            eligible, eligibility_reason = (
++                can_use_fused_qkvzba_causal_conv1d_update_contiguous(
++                    projected_qkvz,
++                    projected_ba,
++                    conv_states,
++                    layer.conv_weights,
++                    layer.bias,
++                    cache_indices,
++                    qkv_dim=qkv_dim,
++                    v_dim=layer.v_dim,
++                    num_v_heads=layer.num_v_heads,
++                    activation=layer.activation,
++                )
++            )
++            if eligible:
++                if not _fused_decode_proj_conv_logged:
++                    rank0_log("Using fused GDN decode QKVZ/BA unpack + indexed Conv1D.")
++                    _fused_decode_proj_conv_logged = True
++                mixed_qkv, z, b, a = (
++                    fused_qkvzba_causal_conv1d_update_contiguous(
++                        projected_qkvz,
++                        projected_ba,
++                        conv_states,
++                        layer.conv_weights,
++                        layer.bias,
++                        cache_indices,
++                        qkv_dim=qkv_dim,
++                        v_dim=layer.v_dim,
++                        num_v_heads=layer.num_v_heads,
++                        head_v_dim=layer.head_v_dim,
++                        activation=layer.activation,
++                    )
++                )
++                conv_already_applied = True
++            else:
++                if not _fused_decode_proj_conv_fallback_logged:
++                    rank0_log(
++                        "Falling back from fused GDN decode projection/Conv1D: "
++                        f"{eligibility_reason}"
++                    )
++                    _fused_decode_proj_conv_fallback_logged = True
++                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
++                    projected_qkvz,
++                    projected_ba,
++                    layer.num_q_heads,
++                    layer.num_v_heads,
++                    layer.head_q_dim,
++                    layer.head_v_dim,
++                )
++            return_z = True
++        else:
++            assert isinstance(mixed_qkv, torch.Tensor)
++
++        if not conv_already_applied:
++            mixed_qkv = causal_conv1d_update(
++                mixed_qkv,
++                conv_states,
++                layer.conv_weights,
++                layer.bias,
++                layer.activation,
++                conv_state_indices=cache_indices,
++            )
+ 
+         # Skip split + reshape + separate gating kernel by consuming
+         # the packed mixed_qkv directly in a single fused Triton kernel.
+@@ -486,7 +556,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             self._track_mamba_state_decode(
+                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+             )
+-            return core_attn_out
++            return (core_attn_out, z) if return_z else core_attn_out
+ 
+         query, key, value = torch.split(
+             mixed_qkv,
+@@ -516,7 +586,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
+             forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+         )
+ 
+-        return core_attn_out
++        return (core_attn_out, z) if return_z else core_attn_out
+ 
+     def forward_extend(
+         self,
 diff --git a/python/sglang/srt/layers/attention/qsa/__init__.py b/python/sglang/srt/layers/attention/qsa/__init__.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..d7a9e3b1297365fcafdbb47c5ea3a1468a0423d0
@@ -5518,10 +6100,10 @@ index 0000000000000000000000000000000000000000..16ed0bb2d9b0fe148cee4ba2499bdc96
 +    )
 diff --git a/python/sglang/srt/layers/attention/qsa/kernel.py b/python/sglang/srt/layers/attention/qsa/kernel.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469adb4c3f488
+index 0000000000000000000000000000000000000000..19e3dd20300fc0d9069c1d5a119b1489f5d30c48
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/kernel.py
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,396 @@
 +"""CUDA kernels and tensor transforms for simple QSA."""
 +
 +from __future__ import annotations
@@ -5549,10 +6131,13 @@ index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469ad
 +    row_starts: torch.Tensor,
 +    row_ends: torch.Tensor,
 +    topk: int,
++    *,
++    row_lengths: Optional[torch.Tensor] = None,
 +) -> torch.Tensor:
 +    """Select compressed blocks, with a compatibility fallback for top-k 512."""
 +
-+    lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
++    lengths = row_ends - row_starts if row_lengths is None else row_lengths
++    lengths = lengths.to(device=logits.device, dtype=torch.int32)
 +    starts = row_starts.to(device=logits.device, dtype=torch.int32)
 +    if logits.is_cuda:
 +        if topk == 512:
@@ -5749,19 +6334,44 @@ index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469ad
 +    )
 +
 +
++def _validate_qsa_expansion_output(
++    out: torch.Tensor,
++    rows: int,
++    final_topk: int,
++    device: torch.device,
++) -> None:
++    expected_shape = (rows, final_topk)
++    if tuple(out.shape) != expected_shape:
++        raise ValueError(f"expected output {expected_shape}, got {tuple(out.shape)}")
++    if out.dtype != torch.int32:
++        raise TypeError(f"expected int32 output, got {out.dtype}")
++    if out.device != device:
++        raise ValueError(f"output must be on {device}, got {out.device}")
++    if out.stride(1) != 1:
++        raise ValueError("output rows must be contiguous")
++
++
 +def triton_expand_qsa_block_indices(
 +    block_indices: torch.Tensor,
 +    query_positions: torch.Tensor,
 +    sequence_lengths: torch.Tensor,
 +    compress_ratio: int,
 +    token_topk: int,
++    *,
++    out: Optional[torch.Tensor] = None,
 +) -> torch.Tensor:
 +    """CUDA fast path for fast_topk_v2 output (valid blocks precede -1 padding)."""
 +    rows, block_topk = block_indices.shape
 +    final_topk = token_topk + compress_ratio - 1
-+    output = torch.empty(
-+        (rows, final_topk), dtype=torch.int32, device=block_indices.device
-+    )
++    if out is None:
++        output = torch.empty(
++            (rows, final_topk), dtype=torch.int32, device=block_indices.device
++        )
++    else:
++        _validate_qsa_expansion_output(
++            out, rows, final_topk, block_indices.device
++        )
++        output = out
 +    if rows == 0:
 +        return output
 +    _expand_qsa_block_indices_kernel[(rows,)](
@@ -5787,6 +6397,8 @@ index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469ad
 +    sequence_lengths: torch.Tensor,
 +    compress_ratio: int,
 +    token_topk: int,
++    *,
++    out: Optional[torch.Tensor] = None,
 +) -> torch.Tensor:
 +    """Expand compressed blocks with Triton on CUDA and Torch elsewhere."""
 +
@@ -5808,14 +6420,22 @@ index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469ad
 +            sequence_lengths.to(device=block_indices.device).contiguous(),
 +            compress_ratio,
 +            token_topk,
++            out=out,
 +        )
-+    return torch_expand_qsa_block_indices(
++    result = torch_expand_qsa_block_indices(
 +        block_indices,
 +        query_positions,
 +        sequence_lengths,
 +        compress_ratio,
 +        token_topk,
 +    )
++    if out is None:
++        return result
++    _validate_qsa_expansion_output(
++        out, rows, token_topk + compress_ratio - 1, block_indices.device
++    )
++    out.copy_(result)
++    return out
 +
 +
 +def qsa_sparse_attention(
@@ -5882,10 +6502,10 @@ index 0000000000000000000000000000000000000000..c9500f1bf7859b075f65cbad1cd469ad
 +]
 diff --git a/python/sglang/srt/layers/attention/qsa/metadata.py b/python/sglang/srt/layers/attention/qsa/metadata.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd298874172253
+index 0000000000000000000000000000000000000000..4228f174d8160d0e311e8af923e7e7fc731bbd18
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/metadata.py
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,403 @@
 +"""Metadata owned by the simple QSA implementation.
 +
 +QSA intentionally does not inherit the NSA metadata abstraction. This module
@@ -5915,8 +6535,8 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +        sequence_lengths, compress_ratio, rounding_mode="floor"
 +    )
 +    compressed_cu_seqlens = torch.nn.functional.pad(
-+        compressed_lengths.cumsum(0), (1, 0)
-+    ).to(torch.int32)
++        compressed_lengths.cumsum(0, dtype=torch.int32), (1, 0)
++    )
 +    query_sequence_ids = query_sequence_ids.to(
 +        device=sequence_lengths.device, dtype=torch.long
 +    )
@@ -5929,6 +6549,89 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +    max_blocks = compressed_lengths.index_select(0, query_sequence_ids)
 +    row_ends = row_starts + torch.minimum(visible_blocks, max_blocks)
 +    return row_starts, row_ends, compressed_cu_seqlens
++
++
++def _packed_locations_from_cu_seqlens(
++    token_slot_table: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    packed_size: int,
++    *,
++    position_stride: int = 1,
++    location_divisor: int = 1,
++) -> torch.Tensor:
++    """Flatten ragged token-slot rows in request-major order."""
++
++    offsets = torch.arange(
++        packed_size, dtype=cu_seqlens.dtype, device=token_slot_table.device
++    )
++    sequence_ids = torch.searchsorted(cu_seqlens[1:], offsets, right=True).long()
++    sequence_offsets = offsets.long() - cu_seqlens.index_select(
++        0, sequence_ids
++    ).long()
++    locations = token_slot_table[
++        sequence_ids, sequence_offsets * position_stride
++    ]
++    if location_divisor != 1:
++        locations = locations.long() // location_divisor
++    return locations
++
++
++def build_packed_prefill_locations(
++    token_slot_table: torch.Tensor,
++    sequence_lengths: torch.Tensor,
++    packed_size: int,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Pack full-context token slots and their cumulative row lengths."""
++
++    sequence_lengths = sequence_lengths.to(
++        device=token_slot_table.device, dtype=torch.int32
++    )
++    cu_seqlens = torch.nn.functional.pad(
++        sequence_lengths.cumsum(0, dtype=torch.int32), (1, 0)
++    )
++    locations = _packed_locations_from_cu_seqlens(
++        token_slot_table, cu_seqlens, packed_size
++    )
++    return locations, cu_seqlens
++
++
++def build_qsa_prefill_plan(
++    sequence_lengths: torch.Tensor,
++    query_positions: torch.Tensor,
++    query_sequence_ids: torch.Tensor,
++    token_slot_table: torch.Tensor,
++    compress_ratio: int,
++    num_compressed_tokens: int,
++) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Build layer-invariant packed compressed slots and query row ranges."""
++
++    row_starts, row_ends, compressed_cu_seqlens = build_qsa_row_ranges(
++        sequence_lengths,
++        query_positions,
++        query_sequence_ids,
++        compress_ratio,
++    )
++    row_lengths = (row_ends - row_starts).to(torch.int32)
++    query_sequence_ids = query_sequence_ids.to(
++        device=sequence_lengths.device, dtype=torch.long
++    )
++    row_sequence_lengths = sequence_lengths.to(dtype=torch.int32).index_select(
++        0, query_sequence_ids
++    )
++    compressed_locs = _packed_locations_from_cu_seqlens(
++        token_slot_table,
++        compressed_cu_seqlens,
++        num_compressed_tokens,
++        position_stride=compress_ratio,
++        location_divisor=compress_ratio,
++    )
++    return (
++        compressed_locs,
++        row_starts,
++        row_ends,
++        row_lengths,
++        row_sequence_lengths,
++    )
 +
 +
 +class QSAIndexerMetadata(msgspec.Struct, frozen=True):
@@ -5957,15 +6660,22 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +    req_pool_indices: Optional[torch.Tensor] = None
 +    # One entry per compressed group to (re)write this forward: the
 +    # slot, the group-end token position (sequence-local) and the metadata
-+    # row owning it. For extend forwards, compress_member_rows additionally
-+    # holds each group's first member as a token-row index into this
-+    # forward's packed tensors (extend chunks are group-aligned, so every
-+    # member is in-chunk); paged forwards leave it None and source members
-+    # from the per-request pending ring instead.
++    # row owning it. For extend forwards, compress_member_rows holds each
++    # group's first token-row and compress_group_locs expands it once into
++    # the int32 member matrix shared by every QSA layer. Paged forwards leave
++    # both fields None and source members from the per-request pending ring.
 +    write_locs: Optional[torch.Tensor] = None
 +    compress_group_positions: Optional[torch.Tensor] = None
 +    compress_sequence_ids: Optional[torch.Tensor] = None
 +    compress_member_rows: Optional[torch.Tensor] = None
++    compress_group_locs: Optional[torch.Tensor] = None
++    # Extend-only, layer-invariant packed MQA plan. The location tensor indexes
++    # each layer's compressed buffer; row ranges index that packed gather.
++    prefill_compressed_locs: Optional[torch.Tensor] = None
++    prefill_row_starts: Optional[torch.Tensor] = None
++    prefill_row_ends: Optional[torch.Tensor] = None
++    prefill_row_lengths: Optional[torch.Tensor] = None
++    prefill_row_sequence_lengths: Optional[torch.Tensor] = None
 +    is_cuda_graph: bool = False
 +    graph_write_locs: Optional[torch.Tensor] = None
 +    graph_compressed_page_table: Optional[torch.Tensor] = None
@@ -6012,58 +6722,36 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +    def get_prefill_mqa_inputs(
 +        self,
 +        layer_id: int,
-+        positions: torch.Tensor,
-+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-+        """Gather packed compressed K and ragged ranges for prefill MQA.
++    ) -> Tuple[
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++    ]:
++        """Gather this layer's compressed K with the precomputed prefill plan."""
 +
-+        Compressed slots come straight from the token-slot rows: each
-+        sequence's complete blocks live at ``page * page_size + offset`` of
-+        its assigned pages, in block order.
-+        """
-+
-+        pool = self.token_to_kv_pool
-+        ratio = self.compress_ratio
-+        compressed_buffer = pool.get_qsa_compressed_k_buffer(layer_id)
-+        parts = []
-+        sequence_lengths = self.sequence_lengths.to(torch.int32)
-+        sequence_lengths_list = sequence_lengths.tolist()
-+        for sequence_id in range(len(sequence_lengths_list)):
-+            complete_blocks = (
-+                int(sequence_lengths_list[sequence_id]) // ratio
-+            )
-+            if complete_blocks == 0:
-+                continue
-+            # DSV4-style addressing: a group's compressed slot is its first
-+            # raw slot // ratio (the page-aligned allocator keeps the group
-+            # contiguous in one page), read straight off the request's
-+            # token-slot row.
-+            compressed_locs = (
-+                self.token_slot_table[sequence_id, : complete_blocks * ratio : ratio]
-+                .long()
-+                // ratio
-+            )
-+            parts.append(compressed_buffer.index_select(0, compressed_locs))
-+        compressed_keys = (
-+            torch.cat(parts, dim=0)
-+            if parts
-+            else compressed_buffer.new_empty(
-+                (0, pool.qsa_index_kv_heads, pool.qsa_index_head_dim)
-+            )
++        if (
++            self.prefill_compressed_locs is None
++            or self.prefill_row_starts is None
++            or self.prefill_row_ends is None
++            or self.prefill_row_lengths is None
++            or self.prefill_row_sequence_lengths is None
++        ):
++            raise RuntimeError("QSA prefill metadata is incomplete")
++        compressed_buffer = self.token_to_kv_pool.get_qsa_compressed_k_buffer(
++            layer_id
 +        )
-+        num_valid_tokens = self.token_to_batch_idx.numel()
-+        if positions.numel() < num_valid_tokens:
-+            raise ValueError(
-+                "QSA prefill positions are shorter than the request mapping: "
-+                f"positions={positions.numel()}, mapping={num_valid_tokens}"
-+            )
-+        positions = positions[:num_valid_tokens]
-+        row_starts, row_ends, _ = build_qsa_row_ranges(
-+            sequence_lengths,
-+            positions.to(sequence_lengths.device),
-+            self.token_to_batch_idx.to(sequence_lengths.device),
-+            self.compress_ratio,
++        compressed_keys = compressed_buffer.index_select(
++            0, self.prefill_compressed_locs
 +        )
-+        return compressed_keys, row_starts, row_ends, sequence_lengths
++        return (
++            compressed_keys,
++            self.prefill_row_starts,
++            self.prefill_row_ends,
++            self.prefill_row_lengths,
++            self.prefill_row_sequence_lengths,
++        )
 +
 +    def get_decode_mqa_inputs(
 +        self, layer_id: int
@@ -6213,6 +6901,8 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +
 +__all__ = [
 +    "QSAIndexerMetadata",
++    "build_packed_prefill_locations",
++    "build_qsa_prefill_plan",
 +    "build_qsa_row_ranges",
 +    "build_pending_ring_slots",
 +    "build_group_ring_slots",
@@ -6221,10 +6911,10 @@ index 0000000000000000000000000000000000000000..b7a41afd9c29cdb9f5e6e51751dd2988
 +]
 diff --git a/python/sglang/srt/layers/attention/qsa/mqa.py b/python/sglang/srt/layers/attention/qsa/mqa.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35aa1acd61
+index 0000000000000000000000000000000000000000..427dee3d1fa04b5137e6ade756e9787276fe7c14
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/mqa.py
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,441 @@
 +"""Weight-free TileLang MQA operators for the simple QSA indexer.
 +
 +The CUDA kernels are reduced versions of the previously validated Qwen MQA
@@ -6534,7 +7224,7 @@ index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35
 +    # Allocate the padded output once. Appending even a few padding rows with
 +    # torch.cat would allocate and copy the entire [rows, keys] FP32 matrix,
 +    # temporarily doubling the dominant prefill buffer for long contexts.
-+    logits = torch.zeros(
++    logits = torch.empty(
 +        (padded_rows, keys), dtype=torch.float32, device=q.device
 +    )
 +    q_padded = q.to(torch.bfloat16).contiguous()
@@ -6567,6 +7257,8 @@ index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35
 +    context_lens: torch.Tensor,
 +    max_model_len: int,
 +    score_scale: Optional[float] = None,
++    *,
++    initialize_padding: bool = True,
 +) -> torch.Tensor:
 +    """Validated TileLang paged decode kernel with weights removed."""
 +
@@ -6579,12 +7271,17 @@ index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35
 +            "TileLang QSA decode requires a compressed page size of "
 +            f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
 +        )
-+    logits = torch.full(
-+        (q.shape[0], max_model_len),
-+        -float("inf"),
-+        dtype=torch.float32,
-+        device=q.device,
-+    )
++    if initialize_padding:
++        logits = torch.full(
++            (q.shape[0], max_model_len),
++            -float("inf"),
++            dtype=torch.float32,
++            device=q.device,
++        )
++    else:
++        logits = torch.empty(
++            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
++        )
 +    if not q.shape[0] or not max_model_len:
 +        return logits
 +    # The validated MMA layout requires N (the Q-head dimension) to be a
@@ -6632,10 +7329,18 @@ index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35
 +    context_lens: torch.Tensor,
 +    max_model_len: int,
 +    score_scale: Optional[float] = None,
++    *,
++    initialize_padding: bool = True,
 +) -> torch.Tensor:
 +    if q.is_cuda and HAS_TILELANG:
 +        return tilelang_qsa_mqa_decode(
-+            q, k_cache, page_table, context_lens, max_model_len, score_scale
++            q,
++            k_cache,
++            page_table,
++            context_lens,
++            max_model_len,
++            score_scale,
++            initialize_padding=initialize_padding,
 +        )
 +    return torch_qsa_mqa_decode(
 +        q, k_cache, page_table, context_lens, max_model_len, score_scale
@@ -6653,10 +7358,10 @@ index 0000000000000000000000000000000000000000..a2bfed445dac8b07857122e7ee8a5d35
 +]
 diff --git a/python/sglang/srt/layers/attention/qsa/qsa_indexer.py b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b29388a353f9
+index 0000000000000000000000000000000000000000..28b89eefb958adfc03314117ba2e052c5146f55f
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/qsa_indexer.py
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,670 @@
 +"""QSA indexer for Qwen4-Exp checkpoints."""
 +
 +from __future__ import annotations
@@ -6687,6 +7392,8 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +# Top-k is row-independent, so large scheduler chunks can be scored in smaller
 +# row tiles without changing the selected blocks.
 +_QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
++
++
 +def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
 +    if rows <= 0 or keys <= 0:
 +        return max(rows, 1)
@@ -6816,6 +7523,18 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +        self._rope_axis_map_cache = axis_map.to(device)
 +        return self._rope_axis_map_cache
 +
++    def _ensure_rope_cache_for_positions(self, positions: torch.Tensor) -> None:
++        """Grow standalone CPU caches; serving CUDA caches are pre-reserved."""
++
++        if (
++            positions.numel() == 0
++            or positions.is_cuda
++            or get_is_capture_mode()
++            or not hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
++        ):
++            return
++        self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
++
 +    def project_qk(
 +        self,
 +        hidden_states: torch.Tensor,
@@ -6838,12 +7557,7 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +                qsa_index_q_norm_rope_store,
 +            )
 +
-+            if not get_is_capture_mode() and hasattr(
-+                self.rotary_emb, "_ensure_cos_sin_cache_length"
-+            ):
-+                self.rotary_emb._ensure_cos_sin_cache_length(
-+                    int(positions.max().item())
-+                )
++            self._ensure_rope_cache_for_positions(positions)
 +            key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
 +            q = qsa_index_q_norm_rope_store(
 +                qk,
@@ -6980,16 +7694,16 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +            )
 +        if metadata.write_locs.numel() == 0:
 +            return
-+        group_end_positions = metadata.compress_group_positions.long()
 +        compressed_locs = metadata.write_locs
 +        if is_extend:
 +            # Extend chunks are group-aligned, so every member of every
 +            # planned group is a token of THIS forward: source the members
 +            # from the packed chunk tensors directly (no cache round trip).
-+            member_rows = metadata.compress_member_rows.long()
-+            group_locs = member_rows[:, None] + torch.arange(
-+                self.compress_ratio, device=member_rows.device, dtype=torch.long
-+            )
++            group_locs = metadata.compress_group_locs
++            if group_locs is None:
++                raise RuntimeError(
++                    "QSA extend metadata is missing compress group locations"
++                )
 +            source_keys = token_k
 +            source_rope = metadata.extend_rope_matrix
 +            if source_rope is None:
@@ -7003,7 +7717,7 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +            if group_locs is None:
 +                group_locs = self._group_ring_slots(
 +                    metadata,
-+                    group_end_positions,
++                    metadata.compress_group_positions.long(),
 +                    metadata.compress_sequence_ids.long(),
 +                )
 +            source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
@@ -7017,10 +7731,11 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +                source_rope=source_rope,
 +            )
 +            return
-+        key_groups = source_keys[group_locs]
++        fallback_group_locs = group_locs.long()
++        key_groups = source_keys[fallback_group_locs]
 +        pooled = average_pool_qsa_keys(key_groups)
 +        compressed_rope_positions = self._rope_from_matrix(
-+            source_rope[group_locs[:, 0]]
++            source_rope[fallback_group_locs[:, 0]]
 +        )
 +        normalized = self.normalize_compressed_keys(pooled, compressed_rope_positions)
 +        pool.set_qsa_compressed_k_buffer(self.layer_id, compressed_locs, normalized)
@@ -7070,8 +7785,7 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +        num_positions = positions.shape[-1] if positions.ndim == 2 else positions.numel()
 +        if num_positions != tensor.shape[0]:
 +            raise ValueError("QSA RoPE positions must match the token dimension")
-+        if not get_is_capture_mode() and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length"):
-+            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
++        self._ensure_rope_cache_for_positions(positions)
 +
 +        # Let the exact Qwen4-Exp RoPE instance compose regular or three-axis
 +        # multimodal positions.  Its public cache view repeats cos/sin to the
@@ -7099,6 +7813,7 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +        compressed_keys: torch.Tensor,
 +        row_starts: torch.Tensor,
 +        row_ends: torch.Tensor,
++        row_lengths: torch.Tensor,
 +        query_positions: torch.Tensor,
 +        sequence_lengths_for_rows: torch.Tensor,
 +    ) -> torch.Tensor:
@@ -7136,17 +7851,18 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +                    logits,
 +                    row_starts[chunk_slice],
 +                    row_ends[chunk_slice],
++                    row_lengths=row_lengths[chunk_slice],
 +                    topk=self.block_topk,
 +                )
-+            selected = expand_qsa_block_indices(
++            expand_qsa_block_indices(
 +                block_indices,
 +                query_positions[chunk_slice],
 +                sequence_lengths_for_rows[chunk_slice],
 +                compress_ratio=self.compress_ratio,
 +                token_topk=self.token_topk,
++                out=output[chunk_slice],
 +            )
-+            output[chunk_slice].copy_(selected)
-+            del logits, block_indices, selected
++            del logits, block_indices
 +        return output
 +
 +    def select_decode_tokens(
@@ -7159,12 +7875,15 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +        query_positions: torch.Tensor,
 +        sequence_lengths: torch.Tensor,
 +    ) -> torch.Tensor:
++        # Top-k only reads each row's compressed length; the decode kernel writes
++        # that full prefix, so initializing the unused max-length tail is wasted.
 +        logits = qsa_mqa_decode(
 +            q,
 +            compressed_cache,
 +            compressed_page_table,
 +            compressed_lengths,
 +            max_model_len,
++            initialize_padding=False,
 +        )
 +        if logits.is_cuda and self.block_topk == 512:
 +            # Decode rows start at zero, so lengths are the compressed lengths
@@ -7292,20 +8011,19 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +                indexer_metadata.get_seqlens_int32(),
 +            )
 +
-+        compressed_keys, row_starts, row_ends, sequence_lengths = (
-+            indexer_metadata.get_prefill_mqa_inputs(
-+                self.layer_id, logical_positions
-+            )
-+        )
-+        query_sequence_ids = indexer_metadata.get_token_to_batch_idx()
-+        row_sequence_lengths = sequence_lengths.index_select(
-+            0, query_sequence_ids.long()
-+        )
++        (
++            compressed_keys,
++            row_starts,
++            row_ends,
++            row_lengths,
++            row_sequence_lengths,
++        ) = indexer_metadata.get_prefill_mqa_inputs(self.layer_id)
 +        return self.select_prefill_tokens(
 +            q,
 +            compressed_keys,
 +            row_starts,
 +            row_ends,
++            row_lengths,
 +            logical_positions,
 +            row_sequence_lengths,
 +        )
@@ -7316,10 +8034,10 @@ index 0000000000000000000000000000000000000000..ddbbdaf2a48a93184a6602cef6e4b293
 +]
 diff --git a/python/sglang/srt/layers/attention/qsa/sparse_attn.py b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..15e5af56c25b18e25809884112c53ca954aed083
+index 0000000000000000000000000000000000000000..b0aa5e934a65b838ee10f6b458fee8dc42a73b41
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qsa/sparse_attn.py
-@@ -0,0 +1,456 @@
+@@ -0,0 +1,466 @@
 +"""Validated sparse GQA operators migrated from the QSA reference branch."""
 +
 +from typing import Optional
@@ -7585,12 +8303,22 @@ index 0000000000000000000000000000000000000000..15e5af56c25b18e25809884112c53ca9
 +    )
 +
 +
-+def sparse_gqa_fwd_interface_triton_ck(q, k, v, indices, cu_q, cu_k, kv_lens, scale):
++def sparse_gqa_fwd_interface_triton_ck(
++    q,
++    k,
++    v,
++    indices,
++    cu_q,
++    cu_k,
++    kv_lens,
++    scale,
++    *,
++    max_q: int,
++):
 +    k, v = k.contiguous(), v.contiguous()
 +    total_q, num_q_heads, head_dim = q.shape
 +    num_kv_heads = k.shape[1]
 +    group_size = num_q_heads // num_kv_heads
-+    max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
 +    block_m = max(16, triton.next_power_of_2(group_size))
 +    block_n, warps, stages = _get_best_config(total_q)
 +    out = torch.empty_like(q)
@@ -7778,10 +8506,10 @@ index 0000000000000000000000000000000000000000..15e5af56c25b18e25809884112c53ca9
 +]
 diff --git a/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a9189a9e0
+index 0000000000000000000000000000000000000000..bac35bf333afa507bda9227f9f99ba720daa7fd5
 --- /dev/null
 +++ b/python/sglang/srt/layers/attention/qwen_sparse_attn_backend.py
-@@ -0,0 +1,1882 @@
+@@ -0,0 +1,2154 @@
 +"""Sparse-attention backend for Qwen4-Exp models with an indexer.
 +
 +The backend is installed as the full-attention side of Qwen4-Exp's hybrid backend;
@@ -7799,6 +8527,8 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +import msgspec
 +import torch
 +import torch.nn.functional as F
++import triton
++import triton.language as tl
 +
 +from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 +from sglang.srt.layers.attention.qsa.config import (
@@ -7810,7 +8540,9 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +from sglang.srt.layers.attention.qsa.metadata import (
 +    QSAIndexerMetadata,
 +    build_group_ring_slots,
++    build_packed_prefill_locations,
 +    build_pending_ring_slots,
++    build_qsa_prefill_plan,
 +    build_rope_position_matrix,
 +    compressed_decode_view,
 +)
@@ -7827,6 +8559,95 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +
 +
 +_TRTLLM_SPARSE_PAGE_SIZE = 64
++
++
++@triton.jit
++def _pack_qsa_prefill_kv(
++    k,
++    v,
++    locations,
++    out_k,
++    out_v,
++    num_tokens,
++    sk_n: tl.constexpr,
++    sk_h: tl.constexpr,
++    sk_d: tl.constexpr,
++    sv_n: tl.constexpr,
++    sv_h: tl.constexpr,
++    sv_d: tl.constexpr,
++    sok_n: tl.constexpr,
++    sok_h: tl.constexpr,
++    sok_d: tl.constexpr,
++    sov_n: tl.constexpr,
++    sov_h: tl.constexpr,
++    sov_d: tl.constexpr,
++    DIM: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    token = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
++    head = tl.program_id(1)
++    dims = tl.arange(0, BLOCK_D)
++    valid = token < num_tokens
++    location = tl.load(locations + token, mask=valid, other=0).to(tl.int64)
++    src_k = (
++        k
++        + location[:, None] * sk_n
++        + head * sk_h
++        + dims[None, :] * sk_d
++    )
++    src_v = (
++        v
++        + location[:, None] * sv_n
++        + head * sv_h
++        + dims[None, :] * sv_d
++    )
++    token_i64 = token[:, None].to(tl.int64)
++    dst_k = out_k + token_i64 * sok_n + head * sok_h + dims[None, :] * sok_d
++    dst_v = out_v + token_i64 * sov_n + head * sov_h + dims[None, :] * sov_d
++    mask = valid[:, None] & (dims[None, :] < DIM)
++    tl.store(dst_k, tl.load(src_k, mask=mask), mask=mask)
++    tl.store(dst_v, tl.load(src_v, mask=mask), mask=mask)
++
++
++def _pack_qsa_prefill_kv_triton(k, v, locations, out_k, out_v) -> None:
++    """Gather full-context K/V into request-major reusable scratch."""
++
++    if k.shape[1:] != v.shape[1:] or out_k.shape != out_v.shape:
++        raise ValueError("QSA prefill K/V packing requires matching K/V shapes")
++    num_tokens = locations.numel()
++    if num_tokens == 0:
++        return
++    _, heads, dim = k.shape
++    if out_k.shape != (num_tokens, heads, dim):
++        raise ValueError(
++            "QSA prefill K/V scratch shape does not match packed locations"
++        )
++    block_tokens = 16
++    _pack_qsa_prefill_kv[(triton.cdiv(num_tokens, block_tokens), heads)](
++        k,
++        v,
++        locations,
++        out_k,
++        out_v,
++        num_tokens,
++        k.stride(0),
++        k.stride(1),
++        k.stride(2),
++        v.stride(0),
++        v.stride(1),
++        v.stride(2),
++        out_k.stride(0),
++        out_k.stride(1),
++        out_k.stride(2),
++        out_v.stride(0),
++        out_v.stride(1),
++        out_v.stride(2),
++        DIM=dim,
++        BLOCK_TOKENS=block_tokens,
++        BLOCK_D=triton.next_power_of_2(dim),
++        num_warps=8,
++    )
 +
 +
 +@lru_cache(maxsize=1)
@@ -7895,6 +8716,11 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +    token_slot_table: torch.Tensor
 +    indexer_metadata: QSAIndexerMetadata
 +    row_req_pool_indices: Optional[torch.Tensor] = None
++    prefill_cu_seqlens_q: Optional[torch.Tensor] = None
++    prefill_cu_seqlens_k: Optional[torch.Tensor] = None
++    prefill_kv_locs: Optional[torch.Tensor] = None
++    prefill_max_sequence_length: int = 1
++    prefill_max_query_length: int = 1
 +    is_cuda_graph: bool = False
 +    fa2_valid_counts: Optional[torch.Tensor] = None
 +    fa2_cu_seqlens_k: Optional[torch.Tensor] = None
@@ -7981,12 +8807,10 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +class QwenSparseAttnBackend(AttentionBackend):
 +    """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 +
-+    # GPU-only serving: compressed addressing is arithmetic and the graph
-+    # replay refresh runs on device, so graphed decode iterations never need
-+    # the FutureMap's resolved CPU lengths.  Eager spec paths (bs above the
-+    # graph range, or graphs disabled) pay one explicit readback per forward
-+    # instead of the resolved mirror -- an accepted trade for dropping the
-+    # per-iteration scheduler sync on the graphed serving path.
++    # Regular prefill batches already carry scheduler-maintained CPU lengths.
++    # This flag only gates speculative overlap's per-step D2H mirror; graph
++    # replay refreshes decode metadata on device, and eager speculative paths
++    # accept one explicit readback instead of forcing every decode step to sync.
 +    needs_cpu_seq_lens: bool = False
 +
 +    def __init__(self, runner=None) -> None:
@@ -8017,6 +8841,10 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +        self._cuda_graph_max_tokens = 0
 +        self._fa2_scratch: Dict[
 +            Tuple[int, int, torch.dtype, torch.device],
++            Tuple[torch.Tensor, torch.Tensor],
++        ] = {}
++        self._cuda_graph_fa2_scratch: Dict[
++            Tuple[int, int, torch.dtype, torch.device, int],
 +            Tuple[torch.Tensor, torch.Tensor],
 +        ] = {}
 +        self._graph_seq_lens = None
@@ -8259,6 +9087,12 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            token_to_kv_pool=self.token_to_kv_pool,
 +            compress_ratio=self.token_to_kv_pool.qsa_compress_ratio,
 +            block_topk=self.token_to_kv_pool.qsa_block_topk,
++            compress_group_locs=None,
++            prefill_compressed_locs=None,
++            prefill_row_starts=None,
++            prefill_row_ends=None,
++            prefill_row_lengths=None,
++            prefill_row_sequence_lengths=None,
 +        )
 +        return QwenSparseAttnMetadata(
 +            sequence_lengths=sequence_lengths,
@@ -8266,7 +9100,39 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            token_slot_table=token_slot_table,
 +            indexer_metadata=indexer_metadata,
 +            row_req_pool_indices=torch.zeros(0, dtype=torch.int32, device=device),
++            prefill_cu_seqlens_q=None,
++            prefill_cu_seqlens_k=None,
++            prefill_kv_locs=None,
++            prefill_max_sequence_length=1,
++            prefill_max_query_length=1,
 +        )
++
++    @staticmethod
++    def _prefill_host_sequence_lengths(
++        forward_batch, sequence_lengths: torch.Tensor
++    ) -> torch.Tensor:
++        """Return the scheduler's existing CPU lengths without a CUDA readback."""
++
++        host_lengths = getattr(forward_batch, "seq_lens_cpu", None)
++        if host_lengths is None:
++            if sequence_lengths.is_cuda:
++                raise RuntimeError(
++                    "QSA prefill requires scheduler-provided CPU sequence lengths"
++                )
++            host_lengths = sequence_lengths
++        if isinstance(host_lengths, torch.Tensor):
++            if host_lengths.is_cuda:
++                raise RuntimeError("QSA prefill CPU sequence lengths are on CUDA")
++            host_lengths = host_lengths.to(dtype=torch.int64)
++        else:
++            host_lengths = torch.as_tensor(host_lengths, dtype=torch.int64)
++        num_sequences = sequence_lengths.numel()
++        if host_lengths.numel() < num_sequences:
++            raise ValueError(
++                "QSA prefill CPU sequence lengths are shorter than the batch: "
++                f"lengths={host_lengths.numel()}, batch={num_sequences}"
++            )
++        return host_lengths[:num_sequences]
 +
 +    @staticmethod
 +    def _qsa_write_plan(
@@ -8324,7 +9190,7 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +                valid,
 +                row_token_starts[rows] + blocks * compress_ratio - prefix_lens[rows],
 +                torch.zeros_like(blocks),
-+            )
++            ).to(torch.int32)
 +        return write_locs, group_end_positions, rows, member_rows
 +
 +    def _qsa_build_write_plan(
@@ -8406,6 +9272,7 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +                "mis-mapped to requests"
 +            )
 +        speculative_paged = self._is_speculative_paged_mode(forward_batch.forward_mode)
++        host_sequence_lengths = None
 +        if speculative_paged:
 +            logical_positions = forward_batch.positions
 +            if logical_positions.ndim == 2:
@@ -8432,10 +9299,16 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +        else:
 +            sequence_lengths = forward_batch.seq_lens.to(torch.int32)
 +            batch_size = sequence_lengths.numel()
-+            if forward_batch.seq_lens_cpu is not None:
-+                max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
++            if forward_batch.forward_mode.is_decode():
++                if forward_batch.seq_lens_cpu is not None:
++                    max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
++                else:
++                    max_length = int(sequence_lengths.max())
 +            else:
-+                max_length = int(sequence_lengths.max())
++                host_sequence_lengths = self._prefill_host_sequence_lengths(
++                    forward_batch, sequence_lengths
++                )
++                max_length = int(host_sequence_lengths.max().item())
 +            row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
 +            token_slot_table = self.req_to_token[
 +                row_req_pool_indices.long(), :max_length
@@ -8479,10 +9352,109 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +                        f"mapping={token_to_batch_idx.numel()}, "
 +                        f"positions={num_position_tokens}"
 +                    )
++        decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
++        prefill_cu_seqlens_q = None
++        prefill_cu_seqlens_k = None
++        prefill_kv_locs = None
++        prefill_max_sequence_length = 1
++        prefill_max_query_length = 1
++        prefill_compressed_locs = None
++        prefill_row_starts = None
++        prefill_row_ends = None
++        prefill_row_lengths = None
++        prefill_row_sequence_lengths = None
++        if not decode_like:
++            if host_sequence_lengths is None:
++                raise RuntimeError("QSA prefill CPU sequence lengths are unavailable")
++            total_kv_tokens = int(host_sequence_lengths.sum().item())
++            num_query_tokens = token_to_batch_idx.numel()
++            if total_kv_tokens < num_query_tokens:
++                raise ValueError(
++                    "QSA prefill context is shorter than its query rows: "
++                    f"context={total_kv_tokens}, query={num_query_tokens}"
++                )
++            extend_seq_lens = forward_batch.extend_seq_lens[
++                : sequence_lengths.numel()
++            ].to(device=sequence_lengths.device, dtype=torch.int32)
++            host_extend_lengths = getattr(
++                forward_batch, "extend_seq_lens_cpu", None
++            )
++            if (
++                isinstance(host_extend_lengths, torch.Tensor)
++                and host_extend_lengths.is_cuda
++            ):
++                raise RuntimeError("QSA prefill CPU extend lengths are on CUDA")
++            if host_extend_lengths is None:
++                if extend_seq_lens.is_cuda:
++                    raise RuntimeError(
++                        "QSA prefill requires scheduler-provided CPU extend lengths"
++                    )
++                host_extend_lengths = extend_seq_lens
++            host_extend_lengths = self._as_cpu_int_tensor(
++                host_extend_lengths, sequence_lengths.numel()
++            )
++            if host_extend_lengths.numel() < sequence_lengths.numel():
++                raise ValueError(
++                    "QSA prefill CPU extend lengths are shorter than the batch: "
++                    f"lengths={host_extend_lengths.numel()}, "
++                    f"batch={sequence_lengths.numel()}"
++                )
++            prefill_max_query_length = max(
++                1, int(host_extend_lengths.max().item())
++            )
++            prefill_cu_seqlens_q = F.pad(
++                extend_seq_lens.cumsum(0, dtype=torch.int32), (1, 0)
++            ).contiguous()
++            prefill_max_sequence_length = max_length
++            if total_kv_tokens > num_query_tokens:
++                prefill_kv_locs, prefill_cu_seqlens_k = (
++                    build_packed_prefill_locations(
++                        token_slot_table, sequence_lengths, total_kv_tokens
++                    )
++                )
++            else:
++                prefill_cu_seqlens_k = F.pad(
++                    sequence_lengths.cumsum(0, dtype=torch.int32), (1, 0)
++                ).contiguous()
++            if (
++                self.qsa_profile is None
++                or self.qsa_profile.variant == QSA_VARIANT_COMPRESSED
++            ):
++                prefill_positions = forward_batch.positions.flatten()
++                if prefill_positions.numel() < num_query_tokens:
++                    raise ValueError(
++                        "QSA prefill positions are shorter than the request mapping: "
++                        f"positions={prefill_positions.numel()}, "
++                        f"mapping={num_query_tokens}"
++                    )
++                num_compressed_tokens = int(
++                    torch.div(
++                        host_sequence_lengths,
++                        self.compress_ratio,
++                        rounding_mode="floor",
++                    )
++                    .sum()
++                    .item()
++                )
++                (
++                    prefill_compressed_locs,
++                    prefill_row_starts,
++                    prefill_row_ends,
++                    prefill_row_lengths,
++                    prefill_row_sequence_lengths,
++                ) = build_qsa_prefill_plan(
++                    sequence_lengths,
++                    prefill_positions[:num_query_tokens],
++                    token_to_batch_idx,
++                    token_slot_table,
++                    self.compress_ratio,
++                    num_compressed_tokens,
++                )
 +        write_locs = None
 +        group_positions = None
 +        group_sequence_ids = None
 +        group_member_rows = None
++        compress_group_locs = None
 +        decode_page_table = None
 +        decode_lengths = None
 +        decode_logical_positions = None
@@ -8501,7 +9473,12 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +                    sequence_lengths=sequence_lengths,
 +                )
 +            )
-+            decode_like = speculative_paged or forward_batch.forward_mode.is_decode()
++            if group_member_rows is not None:
++                compress_group_locs = group_member_rows[:, None] + torch.arange(
++                    self.compress_ratio,
++                    dtype=torch.int32,
++                    device=group_member_rows.device,
++                )
 +            if decode_like:
 +                decode_logical_positions = (
 +                    logical_positions.to(torch.int32)
@@ -8563,6 +9540,12 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            compress_group_positions=group_positions,
 +            compress_sequence_ids=group_sequence_ids,
 +            compress_member_rows=group_member_rows,
++            compress_group_locs=compress_group_locs,
++            prefill_compressed_locs=prefill_compressed_locs,
++            prefill_row_starts=prefill_row_starts,
++            prefill_row_ends=prefill_row_ends,
++            prefill_row_lengths=prefill_row_lengths,
++            prefill_row_sequence_lengths=prefill_row_sequence_lengths,
 +            decode_page_table=decode_page_table,
 +            decode_lengths=decode_lengths,
 +            decode_logical_positions=decode_logical_positions,
@@ -8576,6 +9559,11 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            token_slot_table=token_slot_table,
 +            indexer_metadata=indexer_metadata,
 +            row_req_pool_indices=row_req_pool_indices,
++            prefill_cu_seqlens_q=prefill_cu_seqlens_q,
++            prefill_cu_seqlens_k=prefill_cu_seqlens_k,
++            prefill_kv_locs=prefill_kv_locs,
++            prefill_max_sequence_length=prefill_max_sequence_length,
++            prefill_max_query_length=prefill_max_query_length,
 +        )
 +
 +    def init_forward_metadata(self, forward_batch):
@@ -8757,6 +9745,12 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            compress_ratio=pool.qsa_compress_ratio,
 +            block_topk=pool.qsa_block_topk,
 +            req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
++            compress_group_locs=None,
++            prefill_compressed_locs=None,
++            prefill_row_starts=None,
++            prefill_row_ends=None,
++            prefill_row_lengths=None,
++            prefill_row_sequence_lengths=None,
 +            is_cuda_graph=True,
 +            graph_write_locs=self._graph_write_locs[:metadata_rows],
 +            graph_compressed_page_table=self._graph_compressed_page_table[
@@ -8774,6 +9768,11 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            token_slot_table=self._graph_dummy_token_slot_table[:metadata_rows],
 +            indexer_metadata=indexer_metadata,
 +            row_req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
++            prefill_cu_seqlens_q=None,
++            prefill_cu_seqlens_k=None,
++            prefill_kv_locs=None,
++            prefill_max_sequence_length=1,
++            prefill_max_query_length=1,
 +            is_cuda_graph=True,
 +            fa2_valid_counts=self._graph_fa2_valid_counts[:metadata_rows],
 +            fa2_cu_seqlens_k=self._graph_fa2_cu_seqlens_k[: metadata_rows + 1],
@@ -9206,60 +10205,53 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            )
 +            return self._pad_extend_output(output, num_output_rows)
 +
++        metadata = self._resolve_metadata(forward_batch)
++        cu_seqlens_q = metadata.prefill_cu_seqlens_q
++        cu_seqlens_k = metadata.prefill_cu_seqlens_k
++        if cu_seqlens_q is None or cu_seqlens_k is None:
++            raise RuntimeError("QSA prefill attention metadata is incomplete")
 +        topk_indices = topk_indices.to(torch.int32).contiguous()
-+        extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
-+        sequence_lens = [int(x) for x in forward_batch.seq_lens_cpu]
-+        prefix_lens = [
-+            sequence_lens[i] - extend_lens[i] for i in range(len(extend_lens))
-+        ]
-+        cu_seqlens_q = F.pad(
-+            forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
-+            (1, 0),
-+        ).contiguous()
-+        if not any(prefix_lens):
++        if metadata.prefill_kv_locs is None:
 +            output = sparse_gqa_fwd_interface_triton(
 +                q.contiguous(),
 +                k[:num_valid_rows].contiguous(),
 +                v[:num_valid_rows].contiguous(),
-+                max(sequence_lens, default=1),
++                metadata.prefill_max_sequence_length,
 +                topk_indices,
 +                cu_seqlens_q,
 +                layer.scaling,
 +            )
 +            return self._pad_extend_output(output, num_output_rows)
 +
-+        # The validated chunk-prefill kernel consumes tightly packed full-context
-+        # K/V. Current-chunk K/V has already been committed to the cache above.
++        # Current-chunk K/V is already in the cache. One fused device gather
++        # packs the complete contexts into scratch reused by every full-attn layer.
 +        pool = self.token_to_kv_pool
 +        k_buffer = pool.get_key_buffer(layer.layer_id)
 +        v_buffer = pool.get_value_buffer(layer.layer_id)
-+        req_to_token = self.req_to_token_pool.req_to_token
-+        req_indices = forward_batch.req_pool_indices.tolist()
-+        k_parts = [
-+            k_buffer.index_select(
-+                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-+            )
-+            for i in range(len(sequence_lens))
-+        ]
-+        v_parts = [
-+            v_buffer.index_select(
-+                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-+            )
-+            for i in range(len(sequence_lens))
-+        ]
-+        sequence_lens_tensor = torch.tensor(
-+            sequence_lens, dtype=torch.int32, device=q.device
++        packed_k, packed_v = self._get_fa2_scratch(
++            metadata.prefill_kv_locs.numel(),
++            k_buffer.shape[1],
++            k_buffer.shape[2],
++            k_buffer.dtype,
++            k_buffer.device,
 +        )
-+        cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
++        _pack_qsa_prefill_kv_triton(
++            k_buffer,
++            v_buffer,
++            metadata.prefill_kv_locs,
++            packed_k,
++            packed_v,
++        )
 +        output = sparse_gqa_fwd_interface_triton_ck(
 +            q.contiguous(),
-+            torch.cat(k_parts),
-+            torch.cat(v_parts),
++            packed_k,
++            packed_v,
 +            topk_indices,
 +            cu_seqlens_q,
 +            cu_seqlens_k,
-+            sequence_lens_tensor,
++            metadata.sequence_lengths,
 +            layer.scaling,
++            max_q=metadata.prefill_max_query_length,
 +        )
 +        return self._pad_extend_output(output, num_output_rows)
 +
@@ -9284,16 +10276,22 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +        head_dim: int,
 +        dtype: torch.dtype,
 +        device: torch.device,
++        *,
++        cuda_graph: bool = False,
 +    ) -> Tuple[torch.Tensor, torch.Tensor]:
-+        key = (num_kv_heads, head_dim, dtype, device)
-+        buffers = self._fa2_scratch.get(key)
++        # Captured kernels retain raw addresses. Capacity is part of the graph
++        # key so neither eager growth nor a later, wider capture can replace it.
++        base_key = (num_kv_heads, head_dim, dtype, device)
++        key = (*base_key, capacity) if cuda_graph else base_key
++        cache = self._cuda_graph_fa2_scratch if cuda_graph else self._fa2_scratch
++        buffers = cache.get(key)
 +        if buffers is None or buffers[0].shape[0] < capacity:
 +            shape = (capacity, num_kv_heads, head_dim)
 +            buffers = (
 +                torch.empty(shape, dtype=dtype, device=device),
 +                torch.empty(shape, dtype=dtype, device=device),
 +            )
-+            self._fa2_scratch[key] = buffers
++            cache[key] = buffers
 +        return buffers[0][:capacity], buffers[1][:capacity]
 +
 +    def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
@@ -9351,6 +10349,7 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            k_buffer.shape[2],
 +            k_buffer.dtype,
 +            k_buffer.device,
++            cuda_graph=metadata.is_cuda_graph,
 +        )
 +        qwen_sparse_kv_extraction_compact_triton(
 +            k_buffer,
@@ -9480,6 +10479,7 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +            k_buffer.shape[2],
 +            k_buffer.dtype,
 +            k_buffer.device,
++            cuda_graph=metadata.is_cuda_graph,
 +        )
 +        qwen_sparse_kv_extraction_compact_triton(
 +            k_buffer,
@@ -9666,34 +10666,29 @@ index 0000000000000000000000000000000000000000..0d105c2bda3529e13e1c608a948efb1a
 +]
 diff --git a/python/sglang/srt/layers/hc_mix_triton.py b/python/sglang/srt/layers/hc_mix_triton.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..eae575f143a5fde54781be21924153988451b0cc
+index 0000000000000000000000000000000000000000..6c70c8a43d9073f05539c6224b7ff14a4015cec2
 --- /dev/null
 +++ b/python/sglang/srt/layers/hc_mix_triton.py
-@@ -0,0 +1,245 @@
+@@ -0,0 +1,240 @@
 +"""Fused HC low-rank mix for decode-size batches.
 +
-+`GatedResidual._mix_compute` lowers to a five-kernel chain per call
-+(down GEMV + splitK reduce, silu, up GEMV, sigmoid-mul-mean); at bs=1
-+speculative decode that chain runs ~100 times per iteration on the GPU
-+critical path between allreduces, and at these sizes every kernel is
-+latency-bound, so the win comes from kernel count, not bandwidth.
++``GatedResidual._mix_compute`` is five launches in eager/Inductor at decode
++rows. This kernel keeps a grid of exactly one CTA per SM resident for the whole
++operation:
 +
-+One persistent kernel replaces the chain.  A grid of one CTA per SM is
-+resident by construction, which makes the software grid barrier
-+deadlock-free:
-+
-+* phase 0 — zero the fp32 accumulator ``t_raw`` (strided across CTAs)
-+* phase A — grid-strided (n-block, k-chunk) tiles of ``x @ W_down^T``
++* phase 0 - zero the fp32 accumulator ``t_raw`` (strided across CTAs)
++* phase A - grid-strided (n-block, k-chunk) tiles of ``x @ W_down.T``
 +  accumulated into ``t_raw`` with device-scope atomics
-+* phase B — grid-strided output blocks: ``t = silu(t_raw / hc)`` on the
-+  fly, one ``tl.dot`` covering all hc groups, then
-+  ``out_j = mean_g(sigmoid(t @ W_up[g,j]^T) * x[g,j])``
++* phase B - grid-strided output blocks: ``t = silu(t_raw / hc)`` on the
++  fly, one ``tl.dot`` covering all HC groups, then
++  ``out_j = mean_g(sigmoid(t @ W_up[g,j].T) * x[g,j])``
 +
-+The barrier counters are reset by the last CTA to finish, so a captured
-+CUDA graph replays with the buffers back in their initial state.
++The barrier counters are reset by the last CTA to finish, so a captured CUDA
++graph replays with the buffers back in their initial state.
 +
-+Row counts beyond ``_FUSED_MIX_MAX_ROWS`` (prefill) keep the
-+torch.compile path, which uses proper GEMM kernels.
++Row counts beyond ``_FUSED_MIX_MAX_ROWS`` keep the existing ``torch.compile``
++path, because this software grid barrier relies on every CTA being concurrently
++resident.
 +"""
 +
 +from __future__ import annotations
@@ -9917,10 +10912,10 @@ index 0000000000000000000000000000000000000000..eae575f143a5fde54781be2192415398
 +    return out
 diff --git a/python/sglang/srt/layers/hyperconnection.py b/python/sglang/srt/layers/hyperconnection.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..30f7e83008d05ad8a70e7b01bb6f3afa235f78cc
+index 0000000000000000000000000000000000000000..a761864f4040512c0eaeafe6e89395df79c7032a
 --- /dev/null
 +++ b/python/sglang/srt/layers/hyperconnection.py
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,349 @@
 +from typing import Optional
 +
 +import msgspec
@@ -10077,12 +11072,16 @@ index 0000000000000000000000000000000000000000..30f7e83008d05ad8a70e7b01bb6f3afa
 +            from sglang.srt.environ import envs
 +
 +            lowrank = self.config.hc_lowrank
++            cuda_major = (
++                torch.cuda.get_device_capability()[0]
++                if torch.cuda.is_available()
++                else -1
++            )
 +            self._jit_mix_ok = (
 +                envs.SGLANG_HC_MIX_CUDA.get()
-+                and torch.cuda.is_available()
 +                # The CuTe split-K pair is tcgen05 (sm_100 family) only; the
 +                # default-on env must not route Hopper/Ada to it.
-+                and torch.cuda.get_device_capability()[0] == 10
++                and cuda_major == 10
 +                and (self.hc_count * self.hidden_size) % 2048 == 0
 +                and self.hidden_size % 8 == 0
 +                and lowrank > 0
@@ -10114,6 +11113,7 @@ index 0000000000000000000000000000000000000000..30f7e83008d05ad8a70e7b01bb6f3afa
 +                and vecs % (8 * 160) == 0
 +                and (self.hidden_size // 8) % (vecs // 8) == 0
 +            )
++
 +
 +        def _mix_compute(
 +            hyper_input_normed: torch.Tensor,
@@ -10264,6 +11264,192 @@ index 0000000000000000000000000000000000000000..30f7e83008d05ad8a70e7b01bb6f3afa
 +HYPERCONNECTION_CLASS_DICT = {
 +    "hyperconnection_average": HyperConnectionBase,
 +    "gated_residual_simple": GatedResidual,
++}
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128].json b/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128].json
+new file mode 100644
+index 0000000000000000000000000000000000000000..d82c67a85bbb411978d5d3e17d0f03569c18b769
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128].json	
+@@ -0,0 +1,82 @@
++{
++  "1": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 4
++  },
++  "4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 4
++  },
++  "16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 4
++  },
++  "64": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 4
++  },
++  "128": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 3
++  },
++  "256": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3
++  },
++  "512": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 3
++  },
++  "1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3
++  },
++  "2048": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3
++  },
++  "4096": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3
++  }
++}
+diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128]_down.json b/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128]_down.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..c359314a7fa586c5866d5b769e8a04e07ca17f6d
+--- /dev/null
++++ b/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=256,N=640,device_name=NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition,dtype=fp8_w8a8,block_shape=[128, 128]_down.json	
+@@ -0,0 +1,92 @@
++{
++  "1": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3,
++    "USE_TMA": false
++  },
++  "4": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 16,
++    "num_warps": 4,
++    "num_stages": 2,
++    "USE_TMA": false
++  },
++  "16": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 8,
++    "num_warps": 4,
++    "num_stages": 4,
++    "USE_TMA": false
++  },
++  "64": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 32,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 4,
++    "USE_TMA": false
++  },
++  "128": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 1,
++    "num_warps": 4,
++    "num_stages": 2,
++    "USE_TMA": false
++  },
++  "256": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3,
++    "USE_TMA": false
++  },
++  "512": {
++    "BLOCK_SIZE_M": 16,
++    "BLOCK_SIZE_N": 64,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 2,
++    "USE_TMA": false
++  },
++  "1024": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3,
++    "USE_TMA": false
++  },
++  "2048": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3,
++    "USE_TMA": false
++  },
++  "4096": {
++    "BLOCK_SIZE_M": 64,
++    "BLOCK_SIZE_N": 128,
++    "BLOCK_SIZE_K": 128,
++    "GROUP_SIZE_M": 32,
++    "num_warps": 4,
++    "num_stages": 3,
++    "USE_TMA": false
++  }
 +}
 diff --git a/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=512,N=160,device_name=NVIDIA_H200.json b/python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_7_1/E=512,N=160,device_name=NVIDIA_H200.json
 new file mode 100644
@@ -10505,6 +11691,102 @@ index 0000000000000000000000000000000000000000..ef2d06cbd14a0555ed63a48adb864b7a
 +        "num_stages": 2
 +    }
 +}
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index bc8f14f525409d1b33a110623c767c508940add3..e0a362b28867cbac5b8faf02fb470779f1b89a25 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -824,6 +824,18 @@ def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
+     return inputs, topk_weights
+ 
+ 
++def _allocate_fused_topk_outputs(
++    hidden_states: torch.Tensor, topk: int
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    num_tokens = hidden_states.shape[0]
++    return (
++        torch.empty(
++            num_tokens, topk, dtype=torch.float32, device=hidden_states.device
++        ),
++        torch.empty(num_tokens, topk, dtype=torch.int32, device=hidden_states.device),
++    )
++
++
+ def fused_topk(
+     hidden_states: torch.Tensor,
+     gating_output: torch.Tensor,
+@@ -839,15 +851,11 @@ def fused_topk(
+ ):
+     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+ 
+-    M, _ = hidden_states.shape
+-
+-    topk_weights = torch.empty(
+-        M, topk, dtype=torch.float32, device=hidden_states.device
+-    )
+-    topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+-
+     if scoring_func == "softmax":
+         if _use_aiter:
++            topk_weights, topk_ids = _allocate_fused_topk_outputs(
++                hidden_states, topk
++            )
+ 
+             # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
+             topk_weights, topk_ids = aiter_fused_topk(
+@@ -860,6 +868,9 @@ def fused_topk(
+             )
+         # ===== TO BE REFACTORED ====
+         elif packed_out is not None:
++            topk_weights, topk_ids = _allocate_fused_topk_outputs(
++                hidden_states, topk
++            )
+             # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
+             # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
+             from sglang.kernels.ops.moe.trtllm_lora_temp.topk_softmax_pack import (
+@@ -881,19 +892,17 @@ def fused_topk(
+                 moe_fused_gate as _jit_moe_fused_gate,
+             )
+ 
+-            zero_bias = torch.zeros(
+-                gating_output.shape[1],
+-                dtype=torch.float32,
+-                device=gating_output.device,
+-            )
+             topk_weights, topk_ids = _jit_moe_fused_gate(
+                 gating_output,
+-                zero_bias,
++                None,
+                 topk,
+                 scoring_func="softmax",
+                 renormalize=renormalize,
+             )
+         else:
++            topk_weights, topk_ids = _allocate_fused_topk_outputs(
++                hidden_states, topk
++            )
+             topk_softmax(
+                 topk_weights,
+                 topk_ids,
+@@ -902,6 +911,9 @@ def fused_topk(
+             )
+     elif scoring_func == "sigmoid":
+         if _use_aiter and correction_bias is not None:
++            topk_weights, topk_ids = _allocate_fused_topk_outputs(
++                hidden_states, topk
++            )
+             aiter_biased_grouped_topk(
+                 gating_output,
+                 correction_bias.to(dtype=gating_output.dtype),
+@@ -940,6 +952,9 @@ def fused_topk(
+                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+             )
+         else:
++            topk_weights, topk_ids = _allocate_fused_topk_outputs(
++                hidden_states, topk
++            )
+             if num_fused_shared_experts > 1:
+                 raise ValueError(
+                     "sigmoid topk supports at most one fused shared expert"
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
 index 795dfab39aa5add5da005e58a3794d289b79aec2..3acf51f98ee56016c28c7a3096e93d91d495014d 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
@@ -11948,8 +13230,170 @@ index 3f40b902b81a0d7456dd05d9bf57c5627e6cb086..35625a10413b0dfcf2d632966742c94e
          max_total_num_tokens = (
              available_bytes // self._cell_size
              if self._cell_size
+diff --git a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+index f12bef02842424e5ac2d063e6559bcd596341457..8d3675b52a1768af72e1987bec3a23f8ae6372b3 100644
+--- a/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
++++ b/python/sglang/srt/model_executor/runner_backend/breakable_cuda_graph_backend.py
+@@ -18,6 +18,7 @@ No torch.compile.
+ 
+ from __future__ import annotations
+ 
++import dataclasses
+ from contextlib import contextmanager
+ from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+ 
+@@ -26,7 +27,13 @@ import torch
+ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+     set_graph_pool_id,
+ )
++from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
++from sglang.srt.model_executor.forward_context import (
++    ForwardContext,
++    forward_context,
++    get_forward_context,
++)
+ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
+     BaseCudaGraphBackend,
+ )
+@@ -44,9 +51,20 @@ from sglang.srt.model_executor.runner_utils.pool import (
+     graph_pool_capture_scope,
+     graph_pool_replay_scope,
+ )
++
++
+ from sglang.srt.utils import get_bool_env_var
+ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+ 
++_LOGITS_PROCESSOR_TENSOR_FIELDS = (
++    "next_token_logits",
++    "hidden_states",
++    "next_token_logprobs",
++    "input_token_logprobs",
++    "full_logits",
++    "mm_input_embeds",
++)
++
+ if TYPE_CHECKING:
+     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+@@ -68,9 +86,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         debug_eager: bool = False,
+     ) -> None:
+         self._model_runner = cuda_graph_runner.model_runner
++        self._max_output_rows = getattr(
++            cuda_graph_runner, "max_num_token", None
++        ) or getattr(cuda_graph_runner, "max_num_tokens")
+         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
+         self._outputs: Dict[Any, Any] = {}
+         self._capture_inputs: Dict[Any, Any] = {}
++        self._forward_contexts: Dict[Any, ForwardContext] = {}
+         self._pool = None
+         self._device_module = cuda_graph_runner.device_module
+         self._tp_group = cuda_graph_runner.model_runner.tp_group
+@@ -125,9 +147,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         captured_fn = (
+             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
+         )
+-        size = shape_key.size
+         if self._shared_output_buffer is None:
+-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
++            self._shared_output_buffer = self._alloc_full_buffer(
++                warmup_out, self._max_output_rows
++            )
+         with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
+             cuda_graph=graph,
+             pool=self._pool,
+@@ -135,12 +158,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             barrier_fn=self._tp_group.barrier,
+         ):
+             out = captured_fn()
+-            out_rows = self._output_rows(out, size)
++            out_rows = self._output_rows(out, self._max_output_rows)
+             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+ 
+         stored = self._slice_output(self._shared_output_buffer, out_rows)
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = stored
++        self._forward_contexts[shape_key] = get_forward_context()
+         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
+         self._capture_inputs[shape_key] = capture_inputs
+ 
+@@ -155,6 +179,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         if isinstance(output, PPProxyTensors):
+             rows = [t.shape[0] for t in output.tensors.values()]
+             return min([cap, *rows])
++        if isinstance(output, LogitsProcessorOutput):
++            rows = [
++                value.shape[0]
++                for name in _LOGITS_PROCESSOR_TENSOR_FIELDS
++                if torch.is_tensor(value := getattr(output, name))
++            ]
++            return min([cap, *rows])
+         if isinstance(output, (list, tuple)) and output:
+             return min(self._output_rows(o, cap) for o in output if o is not None)
+         return cap
+@@ -172,6 +203,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+                     for key, t in output.tensors.items()
+                 }
+             )
++        if isinstance(output, LogitsProcessorOutput):
++            values = {
++                name: self._alloc_full_buffer(getattr(output, name), size)
++                for name in _LOGITS_PROCESSOR_TENSOR_FIELDS
++            }
++            return dataclasses.replace(output, **values)
+         if isinstance(output, tuple):
+             return tuple(self._alloc_full_buffer(o, size) for o in output)
+         if isinstance(output, list):
+@@ -185,6 +222,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+             return output[:num_tokens]
+         if isinstance(output, PPProxyTensors):
+             return output[:num_tokens]
++        if isinstance(output, LogitsProcessorOutput):
++            values = {
++                name: self._slice_output(getattr(output, name), num_tokens)
++                for name in _LOGITS_PROCESSOR_TENSOR_FIELDS
++            }
++            return dataclasses.replace(output, **values)
+         if isinstance(output, tuple):
+             return tuple(self._slice_output(item, num_tokens) for item in output)
+         if isinstance(output, list):
+@@ -217,6 +260,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+                     tensor, output_buffer.tensors[key], num_tokens
+                 )
+             return
++        if isinstance(output, LogitsProcessorOutput) and isinstance(
++            output_buffer, LogitsProcessorOutput
++        ):
++            for name in _LOGITS_PROCESSOR_TENSOR_FIELDS:
++                self._copy_output_to_buffer(
++                    getattr(output, name), getattr(output_buffer, name), num_tokens
++                )
++            return
+         if isinstance(output, (list, tuple)) and isinstance(
+             output_buffer, type(output)
+         ):
+@@ -247,7 +298,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         static_forward_batch: ForwardBatch,
+         **kwargs,
+     ) -> Any:
+-        with graph_pool_replay_scope():
++        with graph_pool_replay_scope(), forward_context(
++            self._forward_contexts[shape_key]
++        ):
+             self._graphs[shape_key].replay()
+         return self._outputs[shape_key]
+ 
+@@ -256,5 +309,6 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
+         self._graphs.clear()
+         self._outputs.clear()
+         self._capture_inputs.clear()
++        self._forward_contexts.clear()
+         self._pool = None
+         self._shared_output_buffer = None
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded8589f6a5f3 100644
+index f5771a9571ca5dd6f3712e02263f1388ac811be8..f76e80c7871c4273c5ec1607741f577a22d627ba 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -66,6 +66,10 @@ from sglang.srt.layers.parameter import (
@@ -11971,7 +13415,17 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
      get_parallel,
      get_stream,
  )
-@@ -337,6 +342,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -132,6 +137,9 @@ _hip_use_alt_stream = get_bool_env_var("SGLANG_ALT_STREAM") and _is_hip
+ _gdn_use_alt_stream = _is_cuda or (
+     get_bool_env_var("SGLANG_GDN_QKVZ_BA_ALT_STREAM", "False") and _hip_use_alt_stream
+ )
++_gdn_decode_fused_proj_conv = _is_cuda and get_bool_env_var(
++    "SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV", "True"
++)
+ _qknorm_use_alt_stream = _is_cuda or (
+     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
+ )
+@@ -337,6 +345,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
          self._bind_packed_weight_loaders(self.in_proj_qkvz)
          self._bind_packed_weight_loaders(self.in_proj_ba)
@@ -11980,7 +13434,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
          self._fused_input_proj_cpu_enabled = LazyValue(
              lambda: (
                  _is_cpu
-@@ -593,6 +600,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -593,6 +603,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
  
          return query, key, value, z, b, a
  
@@ -12017,7 +13471,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
      def _forward_input_proj(self, hidden_states: torch.Tensor):
          # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
          # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
-@@ -602,6 +639,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -602,6 +642,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
          if _use_aiter and isinstance(hidden_states, tuple):
              return self._forward_input_proj_fused_quant_amd(hidden_states)
  
@@ -12040,7 +13494,58 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
          if (
              _is_cpu
              or _is_npu
-@@ -809,9 +862,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -730,10 +786,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+                     backend, projected_states_qkvz, projected_states_ba, forward_batch
+                 )
+ 
+-        if (
++        use_fused_decode_proj_conv = (
++            _gdn_decode_fused_proj_conv
++            and forward_batch.forward_mode.is_decode()
++            and isinstance(projected_states_qkvz, torch.Tensor)
++            and isinstance(projected_states_ba, torch.Tensor)
++        )
++        use_fused_contiguous_unpack = (
+             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
+-            and not _is_npu
+-        ):
++        )
++        if use_fused_decode_proj_conv:
++            # The backend owns indexed Conv1D state and replaces these
++            # temporary B/A placeholders before recurrent attention.
++            mixed_qkv = (projected_states_qkvz, projected_states_ba)
++            z = None
++            b = projected_states_ba
++            a = projected_states_ba
++        elif use_fused_contiguous_unpack and not _is_npu:
+             if _is_cpu:
+                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+@@ -760,12 +829,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             )
+             mixed_qkv = torch.cat((query, key, value), dim=-1)
+ 
+-        core_attn_out = self.attn(
++        attn_result = self.attn(
+             forward_batch,
+             mixed_qkv=mixed_qkv,
+             a=a,
+             b=b,
+         )
++        if use_fused_decode_proj_conv:
++            if not isinstance(attn_result, tuple) or len(attn_result) != 2:
++                raise RuntimeError(
++                    "Fused GDN decode projection/Conv1D backend must return "
++                    "(core_attn_out, z)"
++                )
++            core_attn_out, z = attn_result
++        else:
++            core_attn_out = attn_result
++        assert z is not None
+ 
+         z_shape_og = z.shape
+         # reshape input data into 2D tensor
+@@ -809,9 +888,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              config, layer_id, quant_config, alt_stream, prefix
          )
  
@@ -12053,7 +13558,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
              self.mlp = Qwen2MoeSparseMoeBlock(
                  layer_id=layer_id,
                  config=config,
-@@ -828,7 +881,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -828,7 +907,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              is_layer_sparse = True
              is_previous_layer_sparse = True
              is_next_layer_sparse = True
@@ -12062,7 +13567,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
              self.mlp = Qwen2MoeMLP(
                  hidden_size=config.hidden_size,
                  intermediate_size=config.intermediate_size,
-@@ -840,8 +893,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -840,8 +919,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
              is_layer_sparse = False
              is_previous_layer_sparse = False
              is_next_layer_sparse = False
@@ -12071,7 +13576,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
  
          self.layer_scatter_modes = LayerScatterModes.init_new(
              layer_id=layer_id,
-@@ -1029,8 +1080,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1029,8 +1106,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
              quant_config=quant_config,
          )
  
@@ -12082,7 +13587,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
              self.mlp = Qwen2MoeMLP(
                  hidden_size=config.hidden_size,
                  intermediate_size=config.intermediate_size,
-@@ -1041,7 +1092,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1041,7 +1118,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
              is_layer_sparse = False
              is_previous_layer_sparse = False
              is_next_layer_sparse = False
@@ -12091,7 +13596,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
              self.mlp = Qwen2MoeSparseMoeBlock(
                  layer_id=layer_id,
                  config=config,
-@@ -1058,8 +1109,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1058,8 +1135,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
              is_layer_sparse = True
              is_previous_layer_sparse = True
              is_next_layer_sparse = True
@@ -12100,7 +13605,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
  
          self.layer_scatter_modes = LayerScatterModes.init_new(
              layer_id=layer_id,
-@@ -1232,38 +1281,51 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1232,38 +1307,51 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          )
          return q, k, v, gate
  
@@ -12166,7 +13671,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
  
          attn_output = self.attn(q, k, v, forward_batch)
  
-@@ -1359,6 +1421,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
+@@ -1359,6 +1447,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
  class Qwen3_5ForCausalLM(nn.Module):
      """Qwen3.5 Model with support for dense variant."""
  
@@ -12175,7 +13680,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
      packed_modules_mapping = {
          "qkv_proj": ["q_proj", "k_proj", "v_proj"],
          "gate_up_proj": ["gate_proj", "up_proj"],
-@@ -1440,20 +1504,12 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1440,20 +1530,12 @@ class Qwen3_5ForCausalLM(nn.Module):
          alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
  
          # Embedding layer
@@ -12198,7 +13703,7 @@ index f5771a9571ca5dd6f3712e02263f1388ac811be8..ef68c2e19a33d92a45904d25359ded85
              if layer_type == "attention":
                  prefix = add_prefix("self_attn", prefix)
              else:
-@@ -1483,6 +1539,18 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -1483,6 +1565,18 @@ class Qwen3_5ForCausalLM(nn.Module):
  
          self.layers_to_capture = []
  
@@ -14953,7 +16458,7 @@ index 7807e8960dab2dd0191c1ea7d3e83eefb839ec45..feda9884ac6e7e4e45903eef8e68e550
          self.draft_extend_attn_backend_list = []
          for step in range(self.speculative_num_steps):
 diff --git a/python/sglang/srt/speculative/spec_utils.py b/python/sglang/srt/speculative/spec_utils.py
-index b0fb39c53915578e6485b8c7cb52a570843e3ef8..543bd194773192741a7d49d2b30d2ee0221b82f1 100644
+index b0fb39c53915578e6485b8c7cb52a570843e3ef8..d658f3ae4e6bc45869ea1c965aca81820606694c 100644
 --- a/python/sglang/srt/speculative/spec_utils.py
 +++ b/python/sglang/srt/speculative/spec_utils.py
 @@ -47,6 +47,7 @@ from sglang.srt.mem_cache.allocation import (
@@ -14988,6 +16493,37 @@ index b0fb39c53915578e6485b8c7cb52a570843e3ef8..543bd194773192741a7d49d2b30d2ee0
      accept_indices_offset = torch.arange(
          0,
          bs * draft_token_num,
+@@ -893,6 +911,30 @@ def commit_mamba_states_after_verify(
+             mamba_steps_to_track=mamba_steps_to_track,
+             null_block_id=-1,
+         )
++        short_conv_pool = getattr(req_pool, "short_conv_pool", None)
++        ngram_pool = getattr(req_pool, "ngram_pool", None)
++        has_ple_state = (
++            getattr(short_conv_pool, "conv_state", None) is not None
++            and getattr(short_conv_pool, "intermediate_conv_state", None) is not None
++        ) or (
++            getattr(ngram_pool, "context", None) is not None
++            and getattr(ngram_pool, "intermediate_context", None) is not None
++        )
++        update_ple_state = getattr(
++            model_runner.attn_backend, "_update_ple_state_after_mtp_verify", None
++        )
++        if has_ple_state and update_ple_state is not None:
++            mamba_track_indices = batch.mamba_track_indices
++            if mamba_track_indices is not None:
++                mamba_track_indices = req_pool.translate_mamba_indices(
++                    mamba_track_indices
++                )
++            update_ple_state(
++                state_indices_tensor=state_batch_indices,
++                last_correct_step_indices=last_correct_step_indices,
++                mamba_track_indices=mamba_track_indices,
++                mamba_steps_to_track=mamba_steps_to_track,
++            )
+         return
+ 
+     if (
 diff --git a/python/sglang/srt/utils/hf_transformers/common.py b/python/sglang/srt/utils/hf_transformers/common.py
 index 5ffa8530c4d70277594e4d28ffdb9e84aa21e993..26588d4531f027f1973cd836df510cde45eca3e5 100644
 --- a/python/sglang/srt/utils/hf_transformers/common.py
@@ -15127,6 +16663,46 @@ index 6970643c191938da1aca03d1e8f7a6873d0cbb7b..fb277a374d05b5d49f770eba4c1c5662
 +
  def format_multichoice_question(row):
      return QUERY_TEMPLATE_MULTICHOICE.format(**row)
+ 
+diff --git a/test/registered/cuda_graph/breakable/test_breakable_cuda_graph.py b/test/registered/cuda_graph/breakable/test_breakable_cuda_graph.py
+index 9ad679fdd8114c9e3996b1d41fab851c62b428cc..9852524049aa6de17f203c7ef70cce6d769b9ca5 100644
+--- a/test/registered/cuda_graph/breakable/test_breakable_cuda_graph.py
++++ b/test/registered/cuda_graph/breakable/test_breakable_cuda_graph.py
+@@ -267,6 +267,35 @@ class TestBreakableCUDAGraphBasic(CustomTestCase):
+         self.assertEqual(forward_batch.out_cache_loc.shape[0], padded_num_tokens)
+ 
+ 
++class TestBreakableCudaGraphBackendOutput(CustomTestCase):
++    def test_logits_processor_output_is_buffered_and_sliced(self):
++        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
++        from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
++            BreakableCudaGraphBackend,
++        )
++
++        backend = BreakableCudaGraphBackend.__new__(BreakableCudaGraphBackend)
++        marker = {"source": ["capture"]}
++        output = LogitsProcessorOutput(
++            next_token_logits=torch.arange(12).reshape(4, 3),
++            hidden_states=torch.arange(8).reshape(4, 2),
++            customized_info=marker,
++        )
++
++        self.assertEqual(backend._output_rows(output, cap=8), 4)
++        buffer = backend._alloc_full_buffer(output, size=8)
++        self.assertEqual(buffer.next_token_logits.shape, (8, 3))
++        self.assertEqual(buffer.hidden_states.shape, (8, 2))
++        backend._copy_output_to_buffer(output, buffer, num_tokens=4)
++        torch.testing.assert_close(buffer.next_token_logits[:4], output.next_token_logits)
++        torch.testing.assert_close(buffer.hidden_states[:4], output.hidden_states)
++
++        sliced = backend._slice_output(buffer, num_tokens=2)
++        self.assertEqual(sliced.next_token_logits.shape, (2, 3))
++        self.assertEqual(sliced.hidden_states.shape, (2, 2))
++        self.assertIs(sliced.customized_info, marker)
++
++
+ class TestCopyOutput(CustomTestCase):
+     """Test the _copy_output helper for structured output writeback."""
  
 diff --git a/test/registered/kernels/benchmark/attention/bench_qsa_indexer.py b/test/registered/kernels/benchmark/attention/bench_qsa_indexer.py
 new file mode 100644
@@ -15572,6 +17148,404 @@ index 0000000000000000000000000000000000000000..fa9d0a79b24f01bc36f42b25f684635e
 +
 +if __name__ == "__main__":
 +    benchmark.run()
+diff --git a/test/registered/kernels/ops/attention/test_gdn_decode_fused_proj_conv.py b/test/registered/kernels/ops/attention/test_gdn_decode_fused_proj_conv.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9dc4bbb68e159d2eb298beed5493d88799d7381
+--- /dev/null
++++ b/test/registered/kernels/ops/attention/test_gdn_decode_fused_proj_conv.py
+@@ -0,0 +1,392 @@
++import unittest
++
++import torch
++
++from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
++    can_use_fused_qkvzba_causal_conv1d_update_contiguous,
++    fused_qkvzba_causal_conv1d_update_contiguous,
++    fused_qkvzba_split_reshape_cat_contiguous,
++)
++
++# This is also the update implementation imported directly by GDNBackend on
++# CUDA; the presence of the optional sgl_kernel AOT extension does not reroute
++# GDN decode through srt.layers.attention.mamba.causal_conv1d.
++from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
++from sglang.test.ci.ci_register import register_cuda_ci
++
++register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
++
++
++def _reference(
++    qkvz,
++    ba,
++    state,
++    weight,
++    bias,
++    indices,
++    *,
++    qkv_dim,
++    v_dim,
++    num_v_heads,
++    head_v_dim,
++    activation,
++):
++    qkv = qkvz[:, :qkv_dim]
++    out = torch.empty_like(qkv)
++    state_out = state.clone()
++    width = weight.shape[1]
++    for row, slot_tensor in enumerate(indices.cpu()):
++        slot = int(slot_tensor)
++        if slot < 0 or slot >= state.shape[0]:
++            out[row].copy_(qkv[row])
++            continue
++        # The deployed direct-Triton decode wrapper uses an effective
++        # state_len=width-1 even if the physical cache envelope is wider.
++        history = state[slot, :, : width - 1].float()
++        values = torch.cat((history, qkv[row, :, None].float()), dim=-1)
++        acc = (values * weight.float()).sum(dim=-1)
++        if bias is not None:
++            acc = acc + bias.float()
++        if activation in ("silu", "swish"):
++            acc = torch.nn.functional.silu(acc)
++        out[row].copy_(acc.to(qkv.dtype))
++        if width > 2:
++            state_out[slot, :, : width - 2].copy_(state[slot, :, 1 : width - 1])
++        state_out[slot, :, width - 2].copy_(qkv[row])
++
++    z = qkvz[:, qkv_dim:].reshape(-1, num_v_heads, head_v_dim).contiguous()
++    b, a = ba.split([num_v_heads, num_v_heads], dim=-1)
++    return out, z, b.contiguous(), a.contiguous(), state_out
++
++
++@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
++class TestGDNDecodeFusedProjectionConv1D(unittest.TestCase):
++    def test_contiguous_unpack_ratio8_microbenchmark_baseline(self):
++        batch = 9
++        num_qk_heads = 1
++        num_v_heads = 8
++        head_dim = 128
++        qkv_dim = (2 * num_qk_heads + num_v_heads) * head_dim
++        v_dim = num_v_heads * head_dim
++        qkvz = torch.randn(
++            batch,
++            qkv_dim + v_dim,
++            device="cuda",
++            dtype=torch.bfloat16,
++        )
++        ba = torch.randn(
++            batch,
++            2 * num_v_heads,
++            device="cuda",
++            dtype=torch.bfloat16,
++        )
++        mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
++            qkvz,
++            ba,
++            num_qk_heads,
++            num_v_heads,
++            head_dim,
++            head_dim,
++        )
++        torch.testing.assert_close(mixed_qkv, qkvz[:, :qkv_dim])
++        torch.testing.assert_close(
++            z, qkvz[:, qkv_dim:].reshape(batch, num_v_heads, head_dim)
++        )
++        torch.testing.assert_close(b, ba[:, :num_v_heads])
++        torch.testing.assert_close(a, ba[:, num_v_heads:])
++
++    def _run_case(
++        self,
++        *,
++        batch,
++        q_dim,
++        k_dim,
++        v_dim,
++        num_v_heads,
++        head_v_dim,
++        width,
++        state_len,
++        dtype,
++        with_bias,
++        activation,
++        strided_state=False,
++        with_padding=False,
++    ):
++        torch.manual_seed(17)
++        device = "cuda"
++        qkv_dim = q_dim + k_dim + v_dim
++        qkvz = torch.randn(batch, qkv_dim + v_dim, device=device, dtype=dtype)
++        ba = torch.randn(batch, 2 * num_v_heads, device=device, dtype=dtype)
++        weight = torch.randn(qkv_dim, width, device=device, dtype=dtype) * 0.1
++        bias = (
++            torch.randn(qkv_dim, device=device, dtype=dtype) * 0.1
++            if with_bias
++            else None
++        )
++        slots = batch + 3
++        if strided_state:
++            backing = torch.randn(
++                slots,
++                state_len,
++                qkv_dim * 2,
++                device=device,
++                dtype=dtype,
++            )
++            state = backing[:, :, ::2].transpose(1, 2)
++            self.assertFalse(state.is_contiguous())
++        else:
++            state = torch.randn(slots, qkv_dim, state_len, device=device, dtype=dtype)
++        indices = torch.randperm(slots, device=device, dtype=torch.int64)[:batch]
++        if with_padding:
++            indices[-1] = -1
++        indices = indices.to(torch.int32)
++
++        ref = _reference(
++            qkvz,
++            ba,
++            state,
++            weight,
++            bias,
++            indices,
++            qkv_dim=qkv_dim,
++            v_dim=v_dim,
++            num_v_heads=num_v_heads,
++            head_v_dim=head_v_dim,
++            activation=activation,
++        )
++        state_test = state.clone(memory_format=torch.preserve_format)
++        out, z, b, a = fused_qkvzba_causal_conv1d_update_contiguous(
++            qkvz,
++            ba,
++            state_test,
++            weight,
++            bias,
++            indices,
++            qkv_dim=qkv_dim,
++            v_dim=v_dim,
++            num_v_heads=num_v_heads,
++            head_v_dim=head_v_dim,
++            activation=activation,
++        )
++        torch.cuda.synchronize()
++
++        atol = 2e-2 if dtype == torch.bfloat16 else 3e-3
++        output_max_diff = (out.float() - ref[0].float()).abs().max().item()
++        state_max_diff = (state_test.float() - ref[4].float()).abs().max().item()
++        print(
++            "case "
++            f"B={batch} QKV={qkv_dim} V={v_dim} W={width} "
++            f"dtype={dtype} output_max_diff={output_max_diff:.8g} "
++            f"state_max_diff={state_max_diff:.8g}",
++            flush=True,
++        )
++        torch.testing.assert_close(out, ref[0], rtol=0, atol=atol)
++        torch.testing.assert_close(z, ref[1], rtol=0, atol=0)
++        torch.testing.assert_close(b, ref[2], rtol=0, atol=0)
++        torch.testing.assert_close(a, ref[3], rtol=0, atol=0)
++        torch.testing.assert_close(state_test, ref[4], rtol=0, atol=0)
++        self.assertEqual(b.data_ptr() % 32, 0)
++        self.assertEqual(a.data_ptr() % 32, 0)
++
++    def test_random_shapes_widths_dtypes_and_state_updates(self):
++        cases = (
++            # Small boundary shapes.
++            dict(
++                batch=1,
++                q_dim=16,
++                k_dim=16,
++                v_dim=32,
++                num_v_heads=2,
++                head_v_dim=16,
++                width=2,
++                state_len=1,
++                dtype=torch.float16,
++                with_bias=False,
++                activation=None,
++            ),
++            dict(
++                batch=17,
++                q_dim=32,
++                k_dim=32,
++                v_dim=64,
++                num_v_heads=4,
++                head_v_dim=16,
++                width=3,
++                state_len=5,
++                dtype=torch.bfloat16,
++                with_bias=True,
++                activation="silu",
++                strided_state=True,
++                with_padding=True,
++            ),
++            # Qwen3.5-35B TP16 local GDN dimensions.
++            dict(
++                batch=32,
++                q_dim=128,
++                k_dim=128,
++                v_dim=256,
++                num_v_heads=2,
++                head_v_dim=128,
++                width=4,
++                state_len=3,
++                dtype=torch.bfloat16,
++                with_bias=False,
++                activation="silu",
++            ),
++            # Large TP-local GDN dimensions with an 8:1 value/key head ratio.
++            dict(
++                batch=8,
++                q_dim=128,
++                k_dim=128,
++                v_dim=1024,
++                num_v_heads=8,
++                head_v_dim=128,
++                width=4,
++                state_len=3,
++                dtype=torch.bfloat16,
++                with_bias=False,
++                activation="silu",
++            ),
++        )
++        for case in cases:
++            with self.subTest(case=case):
++                self._run_case(**case)
++
++    def test_cuda_graph_replay(self):
++        batch = 4
++        qkv_dim, v_dim, num_v_heads, head_v_dim = 128, 64, 2, 32
++        qkvz = torch.randn(batch, qkv_dim + v_dim, device="cuda", dtype=torch.bfloat16)
++        ba = torch.randn(batch, 2 * num_v_heads, device="cuda", dtype=torch.bfloat16)
++        weight = torch.randn(qkv_dim, 4, device="cuda", dtype=torch.bfloat16)
++        state = torch.randn(batch + 1, qkv_dim, 3, device="cuda", dtype=torch.bfloat16)
++        initial_state = state.clone()
++        indices = torch.arange(batch, device="cuda", dtype=torch.int32)
++        # Compile before capture; Triton compilation itself is not graph-safe.
++        fused_qkvzba_causal_conv1d_update_contiguous(
++            qkvz,
++            ba,
++            state,
++            weight,
++            None,
++            indices,
++            qkv_dim=qkv_dim,
++            v_dim=v_dim,
++            num_v_heads=num_v_heads,
++            head_v_dim=head_v_dim,
++            activation="silu",
++        )
++        state.copy_(initial_state)
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            captured = fused_qkvzba_causal_conv1d_update_contiguous(
++                qkvz,
++                ba,
++                state,
++                weight,
++                None,
++                indices,
++                qkv_dim=qkv_dim,
++                v_dim=v_dim,
++                num_v_heads=num_v_heads,
++                head_v_dim=head_v_dim,
++                activation="silu",
++            )
++        state.copy_(initial_state)
++        graph.replay()
++        ref_state = initial_state.clone()
++        ref_qkv, ref_z, ref_b, ref_a = fused_qkvzba_split_reshape_cat_contiguous(
++            qkvz,
++            ba,
++            1,
++            num_v_heads,
++            32,
++            head_v_dim,
++        )
++        ref_qkv = causal_conv1d_update(
++            ref_qkv,
++            ref_state,
++            weight,
++            None,
++            "silu",
++            conv_state_indices=indices,
++        )
++        torch.testing.assert_close(captured[0], ref_qkv, rtol=0, atol=0)
++        torch.testing.assert_close(captured[1], ref_z, rtol=0, atol=0)
++        torch.testing.assert_close(captured[2], ref_b, rtol=0, atol=0)
++        torch.testing.assert_close(captured[3], ref_a, rtol=0, atol=0)
++        torch.testing.assert_close(state, ref_state, rtol=0, atol=0)
++
++    def test_out_of_range_state_slots_are_safely_masked(self):
++        torch.manual_seed(29)
++        batch = 4
++        qkv_dim, v_dim, num_v_heads, head_v_dim = 128, 64, 2, 32
++        qkvz = torch.randn(batch, qkv_dim + v_dim, device="cuda", dtype=torch.bfloat16)
++        ba = torch.randn(batch, 2 * num_v_heads, device="cuda", dtype=torch.bfloat16)
++        weight = torch.randn(qkv_dim, 4, device="cuda", dtype=torch.bfloat16)
++        state = torch.randn(3, qkv_dim, 3, device="cuda", dtype=torch.bfloat16)
++        # -1 is the expected padding sentinel; -2 and len(state) exercise the
++        # hard lower/upper bounds.  Slot 1 remains a normal live update.
++        indices = torch.tensor([-2, -1, state.shape[0], 1], device="cuda")
++        indices = indices.to(torch.int32)
++
++        ref = _reference(
++            qkvz,
++            ba,
++            state,
++            weight,
++            None,
++            indices,
++            qkv_dim=qkv_dim,
++            v_dim=v_dim,
++            num_v_heads=num_v_heads,
++            head_v_dim=head_v_dim,
++            activation="silu",
++        )
++        state_test = state.clone()
++        out, z, b, a = fused_qkvzba_causal_conv1d_update_contiguous(
++            qkvz,
++            ba,
++            state_test,
++            weight,
++            None,
++            indices,
++            qkv_dim=qkv_dim,
++            v_dim=v_dim,
++            num_v_heads=num_v_heads,
++            head_v_dim=head_v_dim,
++            activation="silu",
++        )
++        torch.cuda.synchronize()
++
++        torch.testing.assert_close(out, ref[0], rtol=0, atol=2e-2)
++        torch.testing.assert_close(z, ref[1], rtol=0, atol=0)
++        torch.testing.assert_close(b, ref[2], rtol=0, atol=0)
++        torch.testing.assert_close(a, ref[3], rtol=0, atol=0)
++        torch.testing.assert_close(state_test, ref[4], rtol=0, atol=0)
++
++    def test_fp8_activation_is_an_explicit_fallback(self):
++        if not hasattr(torch, "float8_e4m3fn"):
++            self.skipTest("PyTorch has no FP8 dtype")
++        qkvz = torch.empty(1, 96, device="cuda", dtype=torch.float8_e4m3fn)
++        ba = torch.empty(1, 4, device="cuda", dtype=torch.bfloat16)
++        state = torch.empty(2, 64, 3, device="cuda", dtype=torch.bfloat16)
++        weight = torch.empty(64, 4, device="cuda", dtype=torch.bfloat16)
++        indices = torch.zeros(1, device="cuda", dtype=torch.int32)
++        eligible, reason = can_use_fused_qkvzba_causal_conv1d_update_contiguous(
++            qkvz,
++            ba,
++            state,
++            weight,
++            None,
++            indices,
++            qkv_dim=64,
++            v_dim=32,
++            num_v_heads=2,
++            activation="silu",
++        )
++        self.assertFalse(eligible)
++        self.assertIn("FP16, BF16, or FP32", reason)
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/test/registered/kernels/ops/attention/test_qkvzba_split_ratio3.py b/test/registered/kernels/ops/attention/test_qkvzba_split_ratio3.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..f4513b915492cea72a65f1ff598fb952be09be78
@@ -15654,10 +17628,10 @@ index 0000000000000000000000000000000000000000..f4513b915492cea72a65f1ff598fb952
 +    sys.exit(pytest.main([__file__, "-v"]))
 diff --git a/test/registered/kernels/ops/attention/test_qsa_indexer.py b/test/registered/kernels/ops/attention/test_qsa_indexer.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b38f30e12d
+index 0000000000000000000000000000000000000000..ffd27f831d35218be627bcd4a5eebc250ba9f779
 --- /dev/null
 +++ b/test/registered/kernels/ops/attention/test_qsa_indexer.py
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,477 @@
 +"""Correctness tests for the fused QSA indexer-prep kernels.
 +
 +Compares the fused kernels (and the QSAIndexer wiring around them) against the
@@ -15745,10 +17719,51 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +    return indexer
 +
 +
++def test_rope_cache_growth_remains_available_for_standalone_cpu(monkeypatch):
++    monkeypatch.setattr(
++        "sglang.srt.layers.attention.qsa.qsa_indexer.get_is_capture_mode",
++        lambda: False,
++    )
++    calls = []
++    owner = SimpleNamespace(
++        rotary_emb=SimpleNamespace(
++            cos_sin_cache=torch.empty(8, 4),
++            _ensure_cos_sin_cache_length=calls.append,
++        )
++    )
++
++    QSAIndexer._ensure_rope_cache_for_positions(owner, torch.tensor([7, 8]))
++
++    assert calls == [8]
++
++
++def test_rope_cache_uses_pre_reserved_cuda_boundary_without_growth(monkeypatch):
++    if not torch.cuda.is_available():
++        return
++    monkeypatch.setattr(
++        "sglang.srt.layers.attention.qsa.qsa_indexer.get_is_capture_mode",
++        lambda: False,
++    )
++    calls = []
++    cache = torch.empty(32768, 4, device="cuda")
++    owner = SimpleNamespace(
++        rotary_emb=SimpleNamespace(
++            cos_sin_cache=cache,
++            _ensure_cos_sin_cache_length=calls.append,
++        )
++    )
++    positions = torch.tensor([cache.shape[0] - 1], device="cuda")
++
++    QSAIndexer._ensure_rope_cache_for_positions(owner, positions)
++
++    assert calls == []
++
++
 +class FakePool:
 +    """Minimal stand-in for the QSA KV pool buffers used by the indexer."""
 +
 +    def __init__(self, num_slots, num_compressed, device, dtype=torch.bfloat16):
++        self.index_state_dtype = dtype
 +        self.key_state = torch.zeros(
 +            num_slots, 1, HEAD_DIM, dtype=dtype, device=device
 +        )
@@ -15782,6 +17797,12 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +
 +
 +def _make_metadata(pool, cache_loc, token_slot_table, write_locs):
++    current_positions = torch.nonzero(token_slot_table[0], as_tuple=False).flatten()
++    group_ends = current_positions[(current_positions + 1) % RATIO == 0]
++    offsets = torch.arange(RATIO - 1, -1, -1, device=cache_loc.device)
++    group_locs = token_slot_table[
++        0, (group_ends[:, None] - offsets[None, :]).clamp_min(0)
++    ]
 +    return SimpleNamespace(
 +        token_to_kv_pool=pool,
 +        out_cache_loc=cache_loc,
@@ -15795,7 +17816,8 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +        req_to_token_pool=None,
 +        pending_ring_slots=None,
 +        extend_rope_matrix=None,
-+        compress_group_ring_locs=None,
++        compress_member_rows=None,
++        compress_group_ring_locs=group_locs,
 +    )
 +
 +
@@ -15871,6 +17893,7 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +        logical_positions,
 +        positions,
 +        _make_metadata(pool_ref, cache_loc, token_slot_table, write_locs),
++        state_slots=cache_loc,
 +    )
 +    # Restore the fused switches (instance attributes shadow the methods).
 +    del indexer._use_fused_prep, indexer._use_fused_compress
@@ -15889,6 +17912,7 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +        logical_positions,
 +        positions,
 +        _make_metadata(pool_new, cache_loc, token_slot_table, write_locs),
++        state_slots=cache_loc,
 +        state_stored=True,
 +    )
 +
@@ -15942,7 +17966,9 @@ index 0000000000000000000000000000000000000000..7c50b1ca16e4f102bfb2ad7d781350b3
 +    """The pre-fusion compression chain, via the indexer's own helpers."""
 +    key_groups = pool.get_qsa_key_state_buffer(0)[group_locs.long()]
 +    pooled = average_pool_qsa_keys(key_groups)
-+    rope_positions = indexer._get_group_rope_positions(pool, group_locs[:, 0])
++    rope_positions = indexer._rope_from_matrix(
++        pool.qsa_rope_position_buffer[group_locs[:, 0]]
++    )
 +    normalized = indexer.normalize_compressed_keys(pooled, rope_positions)
 +    pool.set_qsa_compressed_k_buffer(0, write_locs, normalized)
 +
@@ -17011,12 +19037,42 @@ index 0000000000000000000000000000000000000000..cf84e0d1cd900350e2baa77637c73455
 +    import sys
 +
 +    sys.exit(pytest.main([__file__, "-v", "-s"]))
+diff --git a/test/registered/kernels/ops/moe/test_moe_fused_gate.py b/test/registered/kernels/ops/moe/test_moe_fused_gate.py
+index 49614597d1969d7f27f4848fccbc4c72a06a1003..e961208ddfd0cbdc442b03a8b2639d4ed04c5f16 100644
+--- a/test/registered/kernels/ops/moe/test_moe_fused_gate.py
++++ b/test/registered/kernels/ops/moe/test_moe_fused_gate.py
+@@ -343,6 +343,25 @@ def test_moe_fused_gate_softmax_matches_aot(
+     )
+ 
+ 
++@pytest.mark.parametrize("M", [1, 8, 32])
++def test_moe_fused_gate_softmax_none_bias_matches_zero_bias(M: int) -> None:
++    torch.manual_seed(M)
++    scores = torch.randn(M, 256, dtype=torch.float32, device=DEVICE)
++    zero_bias = torch.zeros(256, dtype=torch.float32, device=DEVICE)
++
++    none_w, none_i = moe_fused_gate(
++        scores, None, topk=8, scoring_func="softmax", renormalize=True
++    )
++    zero_w, zero_i = moe_fused_gate(
++        scores, zero_bias, topk=8, scoring_func="softmax", renormalize=True
++    )
++
++    torch.testing.assert_close(none_w, zero_w, rtol=0, atol=0)
++    torch.testing.assert_close(none_i, zero_i, rtol=0, atol=0)
++
++
++
++
+ _SIGMOID_AOT_CASES = get_ci_test_range(
+     [
+         (1, 128, 4, True, True, torch.float32),
 diff --git a/test/registered/kernels/test_hc_mix_triton.py b/test/registered/kernels/test_hc_mix_triton.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b0c9a676585d01d7e5f6fc85ec3ebfdf4a8ada1f
+index 0000000000000000000000000000000000000000..b3d3f6997861e9a235c8918fb7cf60c2577409bb
 --- /dev/null
 +++ b/test/registered/kernels/test_hc_mix_triton.py
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,90 @@
 +import sys
 +import pytest
 +import torch
@@ -17098,6 +19154,8 @@ index 0000000000000000000000000000000000000000..b0c9a676585d01d7e5f6fc85ec3ebfdf
 +    assert fused_err <= eager_err * 1.5 + 1e-6
 +
 +
++
++
 +def test_fused_hc_mix_gate_rejects_prefill_rows():
 +    x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
 +    assert not fused_hc_mix_supported(x, w_down, w_up)
@@ -17107,10 +19165,10 @@ index 0000000000000000000000000000000000000000..b0c9a676585d01d7e5f6fc85ec3ebfdf
 +    sys.exit(pytest.main([__file__, "-v"]))
 diff --git a/test/registered/kernels/test_qsa.py b/test/registered/kernels/test_qsa.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d2756999c
+index 0000000000000000000000000000000000000000..d1302edadbd7b03dffb73aafd715663b297d232b
 --- /dev/null
 +++ b/test/registered/kernels/test_qsa.py
-@@ -0,0 +1,2138 @@
+@@ -0,0 +1,2617 @@
 +import sys
 +from types import ModuleType, SimpleNamespace
 +
@@ -17119,8 +19177,9 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +
 +from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
 +from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-+from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 +from sglang.srt.layers.attention.qsa import dsa_indexer as dsa_indexer_module
++from sglang.srt.layers.attention.qsa import mqa as qsa_mqa_module
++from sglang.srt.layers.attention.qsa import qsa_indexer as qsa_indexer_module
 +from sglang.srt.layers.attention.qsa.metadata import QSAIndexerMetadata
 +from sglang.srt.layers.attention.qsa.kernel import (
 +    average_pool_qsa_keys,
@@ -17970,11 +20029,12 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +            decode_logical_positions=None,
 +            pending_ring_slots=None,
 +            get_token_to_batch_idx=lambda: mapping,
-+            get_prefill_mqa_inputs=lambda layer_id, logical_positions: (
++            get_prefill_mqa_inputs=lambda layer_id: (
 +                torch.empty(0, 1, 128),
 +                torch.zeros(15, dtype=torch.int32),
 +                torch.zeros(15, dtype=torch.int32),
-+                torch.tensor([15], dtype=torch.int32),
++                torch.zeros(15, dtype=torch.int32),
++                torch.full((15,), 15, dtype=torch.int32),
 +            ),
 +        )
 +        indexer = SimpleNamespace(
@@ -17994,7 +20054,7 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +                    rope_rows=rope.numel(),
 +                )
 +            ),
-+            select_prefill_tokens=lambda q, keys, starts, ends, logical, lengths: (
++            select_prefill_tokens=lambda q, keys, starts, ends, row_lengths, logical, lengths: (
 +                q.squeeze(1)
 +            ),
 +        )
@@ -18015,6 +20075,58 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    torch.testing.assert_close(padded, unpadded)
 +    assert padded.shape[0] == 15
 +    assert calls == {"token_rows": 15, "logical_rows": 15, "rope_rows": 15}
++
++
++def test_qsa_indexer_prefill_uses_precomputed_row_lengths():
++    mapping = torch.tensor([1, 0], dtype=torch.int32)
++    range_lengths = torch.tensor([2, 3], dtype=torch.int32)
++    row_sequence_lengths = torch.tensor([7, 9], dtype=torch.int32)
++    captured = {}
++    metadata = SimpleNamespace(
++        token_to_kv_pool=None,
++        compress_member_rows=None,
++        decode_logical_positions=None,
++        pending_ring_slots=None,
++        get_token_to_batch_idx=lambda: mapping,
++        get_prefill_mqa_inputs=lambda layer_id: (
++            torch.empty(0, 1, 128),
++            torch.zeros(2, dtype=torch.int32),
++            torch.zeros(2, dtype=torch.int32),
++            range_lengths,
++            row_sequence_lengths,
++        ),
++    )
++
++    def select(q, keys, starts, ends, packed_lengths, logical, sequence_lengths):
++        captured["range_lengths"] = packed_lengths
++        captured["sequence_lengths"] = sequence_lengths
++        return q.squeeze(1)
++
++    indexer = SimpleNamespace(
++        layer_id=0,
++        project_qk=lambda hidden, rope_positions, **kwargs: (
++            hidden.reshape(-1, 1, 2),
++            hidden.reshape(-1, 1, 2),
++            False,
++        ),
++        _pending_ring_slots=lambda metadata, logical_positions, is_extend: (
++            torch.zeros(logical_positions.numel(), dtype=torch.long)
++        ),
++        update_key_state_and_compress=lambda *args, **kwargs: None,
++        select_prefill_tokens=select,
++    )
++    forward_batch = SimpleNamespace(
++        forward_mode=ForwardMode.EXTEND,
++        positions=torch.tensor([8, 6], dtype=torch.int64),
++        out_cache_loc=torch.arange(2, dtype=torch.int32),
++    )
++    hidden = torch.arange(4, dtype=torch.float32).reshape(2, 2)
++
++    QSAIndexer.forward_cuda(
++        indexer, hidden, forward_batch.positions, forward_batch, metadata
++    )
++    assert captured["range_lengths"] is range_lengths
++    assert captured["sequence_lengths"] is row_sequence_lengths
 +
 +
 +def test_qsa_extend_matches_with_and_without_dp_attention_padding(monkeypatch):
@@ -18090,6 +20202,13 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +
 +    pool = Pool()
 +    backend.token_to_kv_pool = pool
++    backend.forward_metadata = SimpleNamespace(
++        prefill_cu_seqlens_q=torch.tensor([0, 15], dtype=torch.int32, device="cuda"),
++        prefill_cu_seqlens_k=torch.tensor([0, 15], dtype=torch.int32, device="cuda"),
++        prefill_kv_locs=None,
++        prefill_max_sequence_length=15,
++        sequence_lengths=torch.tensor([15], dtype=torch.int32, device="cuda"),
++    )
 +    layer = SimpleNamespace(tp_q_head_num=1, head_dim=2, layer_id=0, scaling=1.0)
 +    topk = torch.zeros(15, 3, dtype=torch.int32, device="cuda")
 +
@@ -18114,6 +20233,138 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    torch.testing.assert_close(padded[:15], unpadded)
 +    torch.testing.assert_close(padded[15], torch.zeros(2, device="cuda"))
 +    assert kernel_shapes == [(15, 15, 15, 15), (15, 15, 15, 15)]
++
++
++def test_qsa_cuda_graph_scratch_survives_eager_growth():
++    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
++    backend._fa2_scratch = {}
++    backend._cuda_graph_fa2_scratch = {}
++    device = torch.device("cpu")
++
++    graph_k, graph_v = backend._get_fa2_scratch(
++        8, 1, 4, torch.bfloat16, device, cuda_graph=True
++    )
++    backend._get_fa2_scratch(16, 1, 4, torch.bfloat16, device)
++
++    same_k, same_v = backend._get_fa2_scratch(
++        8, 1, 4, torch.bfloat16, device, cuda_graph=True
++    )
++    wider_k, wider_v = backend._get_fa2_scratch(
++        16, 1, 4, torch.bfloat16, device, cuda_graph=True
++    )
++
++    assert (same_k.data_ptr(), same_v.data_ptr()) == (
++        graph_k.data_ptr(),
++        graph_v.data_ptr(),
++    )
++    assert wider_k.data_ptr() != graph_k.data_ptr()
++    assert wider_v.data_ptr() != graph_v.data_ptr()
++    assert len(backend._cuda_graph_fa2_scratch) == 2
++
++
++def test_qsa_cuda_prefix_pack_is_request_major_and_reuses_scratch(monkeypatch):
++    if not torch.cuda.is_available():
++        return
++
++    device = torch.device("cuda")
++    locations = torch.tensor(
++        [9, 2, 17, 4, 12, 8, 23, 1, 19, 6, 14],
++        dtype=torch.int32,
++        device=device,
++    )
++    k_buffer = torch.arange(32 * 2 * 4, device=device).reshape(32, 2, 4).to(
++        torch.bfloat16
++    )
++    v_buffer = -k_buffer
++
++    class Pool:
++        def set_kv_buffer(self, layer, loc, k, v):
++            pass
++
++        def get_key_buffer(self, layer_id):
++            return k_buffer
++
++        def get_value_buffer(self, layer_id):
++            return v_buffer
++
++    seen = []
++
++    def fake_chunk_prefill(
++        q, k, v, indices, cu_q, cu_k, kv_lens, scale, *, max_q
++    ):
++        seen.append(
++            (
++                k.data_ptr(),
++                v.data_ptr(),
++                k.clone(),
++                v.clone(),
++                cu_q.clone(),
++                cu_k.clone(),
++                kv_lens.clone(),
++                max_q,
++            )
++        )
++        return q + 1
++
++    monkeypatch.setattr(
++        qsa_backend_module,
++        "sparse_gqa_fwd_interface_triton_ck",
++        fake_chunk_prefill,
++    )
++    pool = Pool()
++    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
++    backend.token_to_kv_pool = pool
++    backend._fa2_scratch = {}
++    backend.forward_metadata = SimpleNamespace(
++        prefill_cu_seqlens_q=torch.tensor(
++            [0, 2, 3], dtype=torch.int32, device=device
++        ),
++        prefill_cu_seqlens_k=torch.tensor(
++            [0, 6, 11], dtype=torch.int32, device=device
++        ),
++        prefill_kv_locs=locations,
++        prefill_max_sequence_length=6,
++        prefill_max_query_length=2,
++        sequence_lengths=torch.tensor([6, 5], dtype=torch.int32, device=device),
++    )
++    layer = SimpleNamespace(tp_q_head_num=2, head_dim=4, layer_id=0, scaling=1.0)
++    batch = SimpleNamespace(
++        forward_mode=ForwardMode.EXTEND,
++        out_cache_loc=torch.arange(3, dtype=torch.int32, device=device),
++    )
++    values = torch.arange(3 * 2 * 4, device=device).reshape(3, 8).to(
++        torch.bfloat16
++    )
++    topk = torch.zeros(3, 2, dtype=torch.int32, device=device)
++
++    for _ in range(2):
++        output = backend.forward_extend(
++            values,
++            values.clone(),
++            values.clone(),
++            layer,
++            batch,
++            save_kv_cache=False,
++            topk_indices=topk,
++        )
++        torch.testing.assert_close(output, values + 1)
++
++    expected_k = k_buffer.index_select(0, locations.long())
++    expected_v = v_buffer.index_select(0, locations.long())
++    for _, _, packed_k, packed_v, cu_q, cu_k, kv_lens, max_q in seen:
++        assert torch.equal(packed_k, expected_k)
++        assert torch.equal(packed_v, expected_v)
++        assert torch.equal(
++            cu_q, torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
++        )
++        assert torch.equal(
++            cu_k, torch.tensor([0, 6, 11], dtype=torch.int32, device=device)
++        )
++        assert torch.equal(
++            kv_lens, torch.tensor([6, 5], dtype=torch.int32, device=device)
++        )
++        assert max_q == 2
++    assert seen[0][:2] == seen[1][:2]
 +
 +
 +def _make_paged_extend_backend():
@@ -18643,10 +20894,11 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +        )
 +
 +    @staticmethod
-+    def get_prefill_mqa_inputs(layer_id, positions):
++    def get_prefill_mqa_inputs(layer_id):
 +        return (
 +            torch.zeros(1, 1, 128),
 +            torch.zeros(1, dtype=torch.int32),
++            torch.ones(1, dtype=torch.int32),
 +            torch.ones(1, dtype=torch.int32),
 +            torch.ones(1, dtype=torch.int32),
 +        )
@@ -18703,6 +20955,155 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    assert ends.tolist() == [2, 2, 3, 3]
 +
 +
++def test_qsa_prefill_metadata_hoists_ragged_ranges_and_locations():
++    pool = _FakeQSAPool(capacity=768)
++    req_to_token = torch.zeros((4, 32), dtype=torch.int32)
++    req_to_token[2, :16] = torch.tensor(
++        [
++            400,
++            401,
++            402,
++            403,
++            120,
++            121,
++            122,
++            123,
++            600,
++            601,
++            602,
++            603,
++            300,
++            301,
++            302,
++            303,
++        ],
++        dtype=torch.int32,
++    )
++    req_to_token[1, :12] = torch.tensor(
++        [40, 41, 42, 43, 700, 701, 702, 703, 200, 201, 202, 203],
++        dtype=torch.int32,
++    )
++    runner = SimpleNamespace(
++        device="cpu",
++        token_to_kv_pool=pool,
++        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
++        model_config=SimpleNamespace(
++            context_len=32,
++            hf_config=SimpleNamespace(indexer_compress_ratio=COMPRESS_RATIO),
++        ),
++    )
++    backend = QwenSparseAttnBackend(runner)
++    forward_batch = SimpleNamespace(
++        req_pool_indices=torch.tensor([2, 1], dtype=torch.int32),
++        seq_lens=torch.tensor([16, 12], dtype=torch.int32),
++        seq_lens_cpu=torch.tensor([16, 12], dtype=torch.int32),
++        seq_lens_sum=28,
++        forward_mode=ForwardMode.EXTEND,
++        extend_seq_lens=torch.tensor([4, 4], dtype=torch.int32),
++        extend_seq_lens_cpu=[4, 4],
++        extend_prefix_lens=torch.tensor([12, 8], dtype=torch.int32),
++        positions=torch.tensor([12, 13, 14, 15, 8, 9, 10, 11], dtype=torch.int64),
++        mrope_positions=None,
++        input_ids=torch.zeros(8, dtype=torch.int32),
++        out_cache_loc=torch.arange(8, dtype=torch.int32),
++        _original_forward_mode=None,
++    )
++
++    backend.init_forward_metadata(forward_batch)
++    metadata = backend.forward_metadata
++    indexer_metadata = metadata.indexer_metadata
++    assert metadata.prefill_cu_seqlens_q.tolist() == [0, 4, 8]
++    assert metadata.prefill_cu_seqlens_k.tolist() == [0, 16, 28]
++    assert metadata.prefill_max_sequence_length == 16
++    assert metadata.prefill_max_query_length == 4
++    assert metadata.prefill_kv_locs.tolist() == (
++        req_to_token[2, :16].tolist() + req_to_token[1, :12].tolist()
++    )
++    assert indexer_metadata.prefill_compressed_locs.tolist() == [
++        100,
++        30,
++        150,
++        75,
++        10,
++        175,
++        50,
++    ]
++    assert indexer_metadata.prefill_row_starts.tolist() == [0, 0, 0, 0, 4, 4, 4, 4]
++    assert indexer_metadata.prefill_row_ends.tolist() == [3, 3, 3, 4, 6, 6, 6, 7]
++    assert indexer_metadata.prefill_row_lengths.dtype == torch.int32
++    assert indexer_metadata.prefill_row_lengths.tolist() == [3, 3, 3, 4, 2, 2, 2, 3]
++    assert indexer_metadata.prefill_row_sequence_lengths.tolist() == [
++        16,
++        16,
++        16,
++        16,
++        12,
++        12,
++        12,
++        12,
++    ]
++    assert indexer_metadata.compress_group_locs.dtype == torch.int32
++    assert indexer_metadata.compress_group_locs.tolist() == [
++        [0, 1, 2, 3],
++        [4, 5, 6, 7],
++        [0, 1, 2, 3],
++        [0, 1, 2, 3],
++    ]
++
++    pool.compressed_k[:, 0, 0] = torch.arange(
++        pool.compressed_k.shape[0], dtype=torch.bfloat16
++    )
++    packed_keys, row_starts, row_ends, row_lengths, row_sequence_lengths = (
++        indexer_metadata.get_prefill_mqa_inputs(layer_id=0)
++    )
++    assert packed_keys[:, 0, 0].tolist() == [100, 30, 150, 75, 10, 175, 50]
++    assert row_starts is indexer_metadata.prefill_row_starts
++    assert row_ends is indexer_metadata.prefill_row_ends
++    assert row_lengths is indexer_metadata.prefill_row_lengths
++    assert row_sequence_lengths is indexer_metadata.prefill_row_sequence_lengths
++
++
++def test_qsa_compression_uses_precomputed_int32_group_locations():
++    token_k = torch.arange(6 * 4, dtype=torch.float32).reshape(6, 1, 4)
++    stored = {}
++
++    class Pool:
++        def set_qsa_compressed_k_buffer(self, layer_id, locs, values):
++            stored["locs"] = locs
++            stored["values"] = values
++
++    group_locs = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
++    metadata = SimpleNamespace(
++        token_to_kv_pool=Pool(),
++        compress_member_rows=torch.tensor([0], dtype=torch.int32),
++        compress_group_locs=group_locs,
++        compress_group_positions=torch.tensor([4], dtype=torch.int32),
++        write_locs=torch.tensor([9], dtype=torch.int32),
++        extend_rope_matrix=torch.zeros(6, 3, dtype=torch.int64),
++        is_cuda_graph=False,
++    )
++    indexer = SimpleNamespace(
++        layer_id=0,
++        compress_ratio=COMPRESS_RATIO,
++        _use_fused_compress=lambda pool: False,
++        _rope_from_matrix=lambda positions: positions[:, 0],
++        normalize_compressed_keys=lambda pooled, positions: pooled,
++    )
++
++    QSAIndexer.update_key_state_and_compress(
++        indexer,
++        token_k,
++        logical_positions=torch.arange(6),
++        rope_positions=torch.arange(6),
++        metadata=metadata,
++        state_stored=True,
++    )
++
++    assert metadata.compress_group_locs is group_locs
++    assert stored["locs"] is metadata.write_locs
++    torch.testing.assert_close(stored["values"], token_k[1:5].mean(dim=0, keepdim=True))
++
++
 +def test_qsa_weight_free_mqa_logits_matches_explicit_formula():
 +    torch.manual_seed(1)
 +    q = torch.randn(3, 4, 128, dtype=torch.bfloat16)
@@ -18720,6 +21121,37 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    torch.testing.assert_close(actual, expected)
 +
 +
++def test_qsa_prefill_mqa_overwrites_empty_ragged_logits(monkeypatch):
++    if not torch.cuda.is_available() or not qsa_mqa_module.HAS_TILELANG:
++        return
++
++    device = torch.device("cuda")
++    torch.manual_seed(11)
++    q = torch.randn(5, 8, 128, dtype=torch.bfloat16, device=device)
++    k = torch.randn(173, 1, 128, dtype=torch.bfloat16, device=device)
++    starts = torch.tensor([3, 21, 65, 101, 140], dtype=torch.int32, device=device)
++    ends = torch.tensor([19, 64, 100, 139, 173], dtype=torch.int32, device=device)
++    expected = qsa_mqa_module.torch_qsa_mqa_prefill(q, k, starts, ends)
++    poisoned_shapes = []
++
++    class PoisonedEmptyTorch:
++        def __getattr__(self, name):
++            return getattr(torch, name)
++
++        @staticmethod
++        def empty(*args, **kwargs):
++            output = torch.empty(*args, **kwargs)
++            output.fill_(torch.finfo(output.dtype).max)
++            poisoned_shapes.append(tuple(output.shape))
++            return output
++
++    monkeypatch.setattr(qsa_mqa_module, "torch", PoisonedEmptyTorch())
++    actual = qsa_mqa_module.qsa_mqa_prefill(q, k, starts, ends)
++
++    assert poisoned_shapes == [(16, 173)]
++    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
++
++
 +def test_qsa_prefill_selection_microchunks_rows(monkeypatch):
 +    rows, keys, heads, head_dim = 65, 64, 4, 8
 +    token_topk, compress_ratio = 8, 4
@@ -18733,6 +21165,7 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    k = torch.randn(keys, 1, head_dim, dtype=torch.bfloat16)
 +    starts = torch.zeros(rows, dtype=torch.int32)
 +    ends = torch.full((rows,), keys, dtype=torch.int32)
++    range_lengths = ends - starts
 +    positions = torch.full((rows,), keys * compress_ratio - 1, dtype=torch.long)
 +    sequence_lengths = torch.full(
 +        (rows,), keys * compress_ratio, dtype=torch.int32
@@ -18745,7 +21178,7 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    )
 +    assert qsa_indexer_module._qsa_prefill_row_chunk_size(rows, keys, heads) == 32
 +    actual = QSAIndexer.select_prefill_tokens(
-+        indexer, q, k, starts, ends, positions, sequence_lengths
++        indexer, q, k, starts, ends, range_lengths, positions, sequence_lengths
 +    )
 +
 +    logits = qsa_mqa_prefill(q, k, starts, ends)
@@ -18878,6 +21311,45 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    assert torch.equal(actual, expected)
 +
 +
++def test_qsa_block_expansion_writes_sliced_offset_output():
++    if not torch.cuda.is_available():
++        return
++
++    rows = 7
++    sequence_lengths = torch.tensor([20, 33, 64, 67, 128, 131, 256])
++    query_positions = sequence_lengths - 2
++    blocks = torch.full((rows, BLOCK_TOPK), -1, dtype=torch.int32)
++    for row, length in enumerate(sequence_lengths):
++        width = min(4, int(length) // COMPRESS_RATIO)
++        blocks[row, :width] = torch.arange(width, dtype=torch.int32)
++    expected = torch_expand_qsa_block_indices(
++        blocks,
++        query_positions,
++        sequence_lengths,
++        COMPRESS_RATIO,
++        TOKEN_TOPK,
++    ).cuda()
++
++    sentinel = -77
++    storage = torch.full(
++        (rows, FINAL_TOPK + 12), sentinel, dtype=torch.int32, device="cuda"
++    )
++    out = storage[:, 5 : 5 + FINAL_TOPK]
++    actual = expand_qsa_block_indices(
++        blocks.cuda(),
++        query_positions.cuda(),
++        sequence_lengths.cuda(),
++        COMPRESS_RATIO,
++        TOKEN_TOPK,
++        out=out,
++    )
++
++    assert actual is out
++    assert torch.equal(actual, expected)
++    assert torch.all(storage[:, :5] == sentinel)
++    assert torch.all(storage[:, 5 + FINAL_TOPK :] == sentinel)
++
++
 +def test_qsa_decode_mqa_reads_paged_cache():
 +    torch.manual_seed(7)
 +    q = torch.randn(2, 4, 128, dtype=torch.bfloat16)
@@ -18898,6 +21370,71 @@ index 0000000000000000000000000000000000000000..eff2eafdecf898761badaf30185d151d
 +    positions = torch.arange(192).unsqueeze(0)
 +    expected.masked_fill_(positions >= context_lens[:, None], -float("inf"))
 +    torch.testing.assert_close(actual, expected)
++
++
++def test_qsa_decode_uninitialized_tail_is_safe_for_length_aware_fast_topk():
++    if not torch.cuda.is_available() or not qsa_mqa_module.HAS_TILELANG:
++        return
++
++    from sglang.kernels.ops.elementwise.fast_topk import fast_topk
++
++    torch.manual_seed(23)
++    device = torch.device("cuda")
++    batch, heads, head_dim = 3, 8, 128
++    page_size, max_model_len = 64, 1024
++    pages_per_row = max_model_len // page_size
++    context_lens = torch.tensor([333, 769, 1003], dtype=torch.int32, device=device)
++    cache = torch.randn(
++        batch * pages_per_row,
++        page_size,
++        1,
++        head_dim,
++        dtype=torch.bfloat16,
++        device=device,
++    )
++    page_table = torch.randperm(
++        batch * pages_per_row, dtype=torch.int32, device=device
++    ).reshape(batch, pages_per_row)
++    q = torch.randn(batch, heads, head_dim, dtype=torch.bfloat16, device=device)
++
++    initialized = qsa_mqa_module.qsa_mqa_decode(
++        q, cache, page_table, context_lens, max_model_len=max_model_len
++    )
++    uninitialized = qsa_mqa_module.qsa_mqa_decode(
++        q,
++        cache,
++        page_table,
++        context_lens,
++        max_model_len=max_model_len,
++        initialize_padding=False,
++    )
++    positions = torch.arange(max_model_len, device=device).unsqueeze(0)
++    unused = positions >= context_lens[:, None]
++    uninitialized.masked_fill_(unused, torch.finfo(torch.float32).max)
++
++    topk = 512
++    initialized_indices = fast_topk(
++        initialized, context_lens, topk, row_starts=None
++    )
++    uninitialized_indices = fast_topk(
++        uninitialized, context_lens, topk, row_starts=None
++    )
++    for row in range(batch):
++        valid_count = min(int(context_lens[row]), topk)
++        expected_indices = initialized_indices[row, :valid_count]
++        actual_indices = uninitialized_indices[row, :valid_count]
++        assert torch.all((actual_indices >= 0) & (actual_indices < context_lens[row]))
++        assert torch.equal(
++            torch.sort(actual_indices).values,
++            torch.sort(expected_indices).values,
++        )
++        expected_values = initialized[row].index_select(0, expected_indices.long())
++        actual_values = uninitialized[row].index_select(0, actual_indices.long())
++        assert torch.equal(
++            torch.sort(actual_values).values,
++            torch.sort(expected_values).values,
++        )
++        assert torch.all(uninitialized_indices[row, valid_count:] == -1)
 +
 +
 +def test_qsa_sparse_attention_matches_explicit_gqa():
@@ -20175,6 +22712,115 @@ index 9407f3b57eaa40815bfd7c09dd0e1915e7f196a6..6b6441ca4afa587e7eefb7e434b7a835
              args.resolve_once()
  
              self.assertTrue(resolution_result(args, "enable_w4a4_mxfp4_megamoe"))
+diff --git a/test/registered/unit/spec/test_ngram_mamba_verify_update.py b/test/registered/unit/spec/test_ngram_mamba_verify_update.py
+index a620b5f2ff6b24cf0dbaaf577f33e660f74c0376..dda2e9781d7f859e21df9ef60c56d165af1e392d 100644
+--- a/test/registered/unit/spec/test_ngram_mamba_verify_update.py
++++ b/test/registered/unit/spec/test_ngram_mamba_verify_update.py
+@@ -96,13 +96,19 @@ class TestNgramLastCorrectStepIndices(CustomTestCase):
+ class TestNgramMambaVerifyUpdate(CustomTestCase):
+     def _make_mock_target_worker(self):
+         target_worker = MagicMock()
+-        target_worker.model_runner.model = MagicMock()
+-        target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
+-            MagicMock()
+-        )
+-        mamba_pool = target_worker.model_runner.req_to_token_pool.mamba_pool
++        model_runner = target_worker.model_runner
++        model_runner.model = MagicMock()
++        model_runner.attn_backend.update_mamba_state_after_mtp_verify = MagicMock()
++        model_runner.attn_backend._update_ple_state_after_mtp_verify = MagicMock()
++        req_pool = model_runner.req_to_token_pool
++        mamba_pool = req_pool.mamba_pool
+         mamba_pool.replayssm_spec_fold = False
++        mamba_pool.replayssm_is_kda = False
+         mamba_pool.replayssm_cache_base = None
++        req_pool.short_conv_pool.conv_state = None
++        req_pool.short_conv_pool.intermediate_conv_state = None
++        req_pool.ngram_pool.context = None
++        req_pool.ngram_pool.intermediate_context = None
+         return target_worker
+ 
+     def test_mamba_verify_update_called_with_correct_indices(self):
+@@ -227,6 +233,79 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
+             )
+         )
+ 
++    def test_replayssm_fold_commits_ple_once_with_computed_indices(self):
++        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
++
++        target_worker = self._make_mock_target_worker()
++        model_runner = target_worker.model_runner
++        req_pool = model_runner.req_to_token_pool
++        req_pool.mamba_pool.replayssm_spec_fold = True
++        req_pool.short_conv_pool.conv_state = torch.empty(1)
++        req_pool.short_conv_pool.intermediate_conv_state = torch.empty(1)
++        req_pool.ngram_pool.context = torch.empty(1, dtype=torch.long)
++        req_pool.ngram_pool.intermediate_context = torch.empty(1, dtype=torch.long)
++
++        state_batch_indices = torch.tensor([7, 3], dtype=torch.int32)
++        translated_track_indices = torch.tensor([11, 13], dtype=torch.int32)
++        req_pool.get_mamba_indices.return_value = state_batch_indices
++        req_pool.translate_mamba_indices.return_value = translated_track_indices
++
++        batch = MagicMock()
++        batch.forward_mode.is_idle.return_value = False
++        batch.req_pool_indices = torch.tensor([2, 5], dtype=torch.int64)
++        batch.mamba_track_indices = torch.tensor([101, 103], dtype=torch.int64)
++        batch.seq_lens = torch.tensor([253, 128], dtype=torch.int32)
++        accept_lens = torch.tensor([4, 3], dtype=torch.int32)
++        accept_index = torch.tensor(
++            [
++                [0, 1, 2, 3, -1],
++                [5, 6, 7, -1, -1],
++            ],
++            dtype=torch.int32,
++        )
++
++        ple_update = model_runner.attn_backend._update_ple_state_after_mtp_verify
++        call_order = []
++        ple_update.side_effect = lambda **_: call_order.append("ple")
++        with patch(
++            "sglang.srt.speculative.spec_utils.mambaish_config",
++            return_value={"some": "config"},
++        ), patch(
++            "sglang.srt.speculative.spec_utils.mamba_track_grid",
++            return_value=256,
++        ), patch(
++            "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold."
++            "commit_gdn_replayssm_fold_after_verify"
++        ) as fold_commit:
++            fold_commit.side_effect = lambda **_: call_order.append("fold")
++            commit_mamba_states_after_verify(
++                target_worker,
++                batch,
++                accept_lens,
++                accept_index,
++                draft_token_num=5,
++            )
++
++        self.assertEqual(call_order, ["fold", "ple"])
++        fold_commit.assert_called_once()
++        model_runner.attn_backend.update_mamba_state_after_mtp_verify.assert_not_called()
++        ple_update.assert_called_once()
++        call_kwargs = ple_update.call_args.kwargs
++        self.assertIs(call_kwargs["state_indices_tensor"], state_batch_indices)
++        self.assertTrue(
++            torch.equal(
++                call_kwargs["last_correct_step_indices"],
++                torch.tensor([3, 2], dtype=torch.int32),
++            )
++        )
++        self.assertIs(call_kwargs["mamba_track_indices"], translated_track_indices)
++        self.assertTrue(
++            torch.equal(
++                call_kwargs["mamba_steps_to_track"],
++                torch.tensor([2, -1], dtype=torch.int32),
++            )
++        )
++
+ 
+ class TestConvWindowDedupLayout(CustomTestCase):
+     """KDA stores conv_state as (K-1, channel), unlike GDN; partial-accept
 diff --git a/test/registered/unit/test_model_overrides.py b/test/registered/unit/test_model_overrides.py
 index b02515befcf8d30fbaec158eed3ed961637c698e..b169ad881e9f1f4d47ea742dd6cb96ede61f202f 100644
 --- a/test/registered/unit/test_model_overrides.py
